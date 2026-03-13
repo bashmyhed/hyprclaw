@@ -158,6 +158,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         LLMProvider::Antigravity => "Antigravity (Claude + Gemini)",
         LLMProvider::GeminiCli => "Gemini CLI",
         LLMProvider::Codex => "OpenAI Codex (ChatGPT Plus/Pro)",
+        LLMProvider::GitHub => "GitHub Models",
+        LLMProvider::Groq => "Groq",
     };
     let requires_agent_runtime = matches!(cli_mode, CliMode::Interactive | CliMode::OneShot(_));
 
@@ -368,6 +370,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         LLMProvider::Local { .. } => hypr_claw_runtime::LLMClientType::Standard(
             hypr_claw_runtime::LLMClient::new(config.provider.base_url(), 1),
         ),
+        LLMProvider::GitHub => {
+            let token = match bootstrap::get_github_token() {
+                Ok(key) => key,
+                Err(e) => {
+                    eprintln!("❌ Failed to retrieve GitHub token: {}", e);
+                    eprintln!("💡 Tip: Run 'hypr-claw config reset' to reconfigure");
+                    return Err(e.into());
+                }
+            };
+            hypr_claw_runtime::LLMClientType::GitHub(
+                hypr_claw_runtime::GitHubModelsClient::new(token, config.model.clone()),
+            )
+        }
+        LLMProvider::Groq => {
+            let api_key = match bootstrap::get_groq_api_key() {
+                Ok(key) => key,
+                Err(e) => {
+                    eprintln!("❌ Failed to retrieve Groq API key: {}", e);
+                    eprintln!("💡 Tip: Run 'hypr-claw config reset' to reconfigure");
+                    return Err(e.into());
+                }
+            };
+            hypr_claw_runtime::LLMClientType::Standard(
+                hypr_claw_runtime::LLMClient::with_api_key_and_model(
+                    config.provider.base_url(),
+                    1,
+                    api_key,
+                    config.model.clone(),
+                ),
+            )
+        }
         LLMProvider::Codex | LLMProvider::Antigravity | LLMProvider::GeminiCli => {
             return Err("Provider does not support agent-mode tool calling".into());
         }
@@ -4002,6 +4035,23 @@ fn build_llm_client_for_provider(
         LLMProvider::Local { .. } => Ok(hypr_claw_runtime::LLMClientType::Standard(
             hypr_claw_runtime::LLMClient::new(provider.base_url(), 1),
         )),
+        LLMProvider::GitHub => {
+            let token = bootstrap::get_github_token().map_err(|e| e.to_string())?;
+            Ok(hypr_claw_runtime::LLMClientType::GitHub(
+                hypr_claw_runtime::GitHubModelsClient::new(token, model.to_string()),
+            ))
+        }
+        LLMProvider::Groq => {
+            let api_key = bootstrap::get_groq_api_key().map_err(|e| e.to_string())?;
+            Ok(hypr_claw_runtime::LLMClientType::Standard(
+                hypr_claw_runtime::LLMClient::with_api_key_and_model(
+                    provider.base_url(),
+                    1,
+                    api_key,
+                    model.to_string(),
+                ),
+            ))
+        }
         LLMProvider::Codex | LLMProvider::Antigravity | LLMProvider::GeminiCli => {
             Err("Provider does not support agent-mode tool calling".to_string())
         }

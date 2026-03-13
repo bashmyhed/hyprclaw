@@ -1,6 +1,7 @@
 //! LLM client type wrapper - supports both standard HTTP and Codex providers.
 
 use crate::codex_adapter::CodexAdapter;
+use crate::github_models_client::GitHubModelsClient;
 use crate::interfaces::RuntimeError;
 use crate::llm_client::LLMClient;
 use crate::types::{LLMResponse, Message};
@@ -9,6 +10,7 @@ use crate::types::{LLMResponse, Message};
 pub enum LLMClientType {
     Standard(LLMClient),
     Codex(CodexAdapter),
+    GitHub(GitHubModelsClient),
 }
 
 impl LLMClientType {
@@ -42,6 +44,7 @@ impl LLMClientType {
                     .await
             }
             Self::Codex(adapter) => adapter.call(system_prompt, messages, tool_schemas).await,
+            Self::GitHub(client) => client.call(system_prompt, messages, tool_schemas).await,
         }
     }
 
@@ -49,7 +52,7 @@ impl LLMClientType {
     pub fn set_model(&self, model: &str) -> Result<(), RuntimeError> {
         match self {
             Self::Standard(client) => client.set_model(model),
-            Self::Codex(_) => Err(RuntimeError::LLMError(
+            Self::Codex(_) | Self::GitHub(_) => Err(RuntimeError::LLMError(
                 "Model switching is not supported for this provider".to_string(),
             )),
         }
@@ -59,7 +62,7 @@ impl LLMClientType {
     pub fn current_model(&self) -> Option<String> {
         match self {
             Self::Standard(client) => client.current_model(),
-            Self::Codex(_) => None,
+            Self::Codex(_) | Self::GitHub(_) => None,
         }
     }
 
@@ -67,7 +70,7 @@ impl LLMClientType {
     pub async fn list_models(&self) -> Result<Vec<String>, RuntimeError> {
         match self {
             Self::Standard(client) => client.list_models().await,
-            Self::Codex(_) => Err(RuntimeError::LLMError(
+            Self::Codex(_) | Self::GitHub(_) => Err(RuntimeError::LLMError(
                 "Model listing is not supported for this provider".to_string(),
             )),
         }

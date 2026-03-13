@@ -23,6 +23,8 @@ pub enum LLMProvider {
     #[serde(rename = "gemini-cli")]
     GeminiCli,
     Codex,
+    GitHub,
+    Groq,
 }
 
 impl LLMProvider {
@@ -38,11 +40,13 @@ impl LLMProvider {
             }
             LLMProvider::GeminiCli => "https://cloudcode-pa.googleapis.com".to_string(),
             LLMProvider::Codex => "https://chatgpt.com/backend-api/codex".to_string(),
+            LLMProvider::GitHub => "https://models.inference.ai.azure.com".to_string(),
+            LLMProvider::Groq => "https://api.groq.com/openai/v1".to_string(),
         }
     }
 
     pub fn requires_api_key(&self) -> bool {
-        matches!(self, LLMProvider::Nvidia | LLMProvider::Google)
+        matches!(self, LLMProvider::Nvidia | LLMProvider::Google | LLMProvider::GitHub | LLMProvider::Groq)
     }
 
     pub fn requires_oauth(&self) -> bool {
@@ -55,7 +59,7 @@ impl LLMProvider {
     pub fn supports_function_calling(&self) -> bool {
         matches!(
             self,
-            LLMProvider::Nvidia | LLMProvider::Google | LLMProvider::Local { .. }
+            LLMProvider::Nvidia | LLMProvider::Google | LLMProvider::Local { .. } | LLMProvider::GitHub | LLMProvider::Groq
         )
     }
 }

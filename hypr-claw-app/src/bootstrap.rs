@@ -4,6 +4,8 @@ use std::io::{self, Write};
 
 const NVIDIA_API_KEY_NAME: &str = "llm/nvidia_api_key";
 const GOOGLE_API_KEY_NAME: &str = "llm/google_api_key";
+const GITHUB_API_KEY_NAME: &str = "llm/github_token";
+const GROQ_API_KEY_NAME: &str = "llm/groq_api_key";
 
 pub fn run_bootstrap() -> Result<Config> {
     println!("\nNo LLM provider configured.");
@@ -14,7 +16,9 @@ pub fn run_bootstrap() -> Result<Config> {
     println!("4. Antigravity (Claude + Gemini via Google OAuth)");
     println!("5. Gemini CLI (Gemini via Google OAuth)");
     println!("6. OpenAI Codex (ChatGPT Plus/Pro via OAuth)");
-    print!("\nChoice [1-6]: ");
+    println!("7. GitHub Models (via PAT)");
+    println!("8. Groq (via API Key)");
+    print!("\nChoice [1-8]: ");
     io::stdout().flush()?;
 
     let mut choice = String::new();
@@ -28,8 +32,10 @@ pub fn run_bootstrap() -> Result<Config> {
         "4" => bootstrap_antigravity(),
         "5" => bootstrap_gemini_cli(),
         "6" => bootstrap_codex(),
+        "7" => bootstrap_github(),
+        "8" => bootstrap_groq(),
         _ => {
-            anyhow::bail!("Invalid choice. Please select 1-6.");
+            anyhow::bail!("Invalid choice. Please select 1-8.");
         }
     }
 }
@@ -264,4 +270,97 @@ fn bootstrap_codex() -> Result<Config> {
     println!("💡 OAuth flow will run on first use");
 
     Ok(config)
+}
+
+
+fn bootstrap_github() -> Result<Config> {
+    println!("\n🔐 GitHub Models Setup");
+    println!("Enter your GitHub Personal Access Token (PAT):");
+    
+    let token = rpassword::read_password().context("Failed to read token")?;
+    if token.trim().is_empty() {
+        anyhow::bail!("Token cannot be empty");
+    }
+
+    let master_key = get_or_create_master_key()?;
+    let cred_store = hypr_claw::infra::credential_store::CredentialStore::new(
+        "./data/credentials",
+        &master_key,
+    )?;
+    cred_store.store_secret(GITHUB_API_KEY_NAME, token.trim())?;
+
+    print!("\nEnter model [openai/gpt-4o]: ");
+    io::stdout().flush()?;
+    let mut model = String::new();
+    io::stdin().read_line(&mut model)?;
+    let model = if model.trim().is_empty() {
+        "openai/gpt-4o".to_string()
+    } else {
+        model.trim().to_string()
+    };
+
+    let config = Config {
+        provider: LLMProvider::GitHub,
+        model,
+    };
+    config.save()?;
+    println!("✅ GitHub Models provider configured");
+    Ok(config)
+}
+
+fn bootstrap_groq() -> Result<Config> {
+    println!("\n🔐 Groq Setup");
+    println!("Enter your Groq API key:");
+    
+    let api_key = rpassword::read_password().context("Failed to read API key")?;
+    if api_key.trim().is_empty() {
+        anyhow::bail!("API key cannot be empty");
+    }
+
+    let master_key = get_or_create_master_key()?;
+    let cred_store = hypr_claw::infra::credential_store::CredentialStore::new(
+        "./data/credentials",
+        &master_key,
+    )?;
+    cred_store.store_secret(GROQ_API_KEY_NAME, api_key.trim())?;
+
+    print!("\nEnter model [llama-3.3-70b-versatile]: ");
+    io::stdout().flush()?;
+    let mut model = String::new();
+    io::stdin().read_line(&mut model)?;
+    let model = if model.trim().is_empty() {
+        "llama-3.3-70b-versatile".to_string()
+    } else {
+        model.trim().to_string()
+    };
+
+    let config = Config {
+        provider: LLMProvider::Groq,
+        model,
+    };
+    config.save()?;
+    println!("✅ Groq provider configured");
+    Ok(config)
+}
+
+pub fn get_github_token() -> Result<String> {
+    let master_key = get_or_create_master_key()?;
+    let cred_store = hypr_claw::infra::credential_store::CredentialStore::new(
+        "./data/credentials",
+        &master_key,
+    )?;
+    cred_store
+        .get_secret(GITHUB_API_KEY_NAME)
+        .context("GitHub token not found. Run bootstrap again.")
+}
+
+pub fn get_groq_api_key() -> Result<String> {
+    let master_key = get_or_create_master_key()?;
+    let cred_store = hypr_claw::infra::credential_store::CredentialStore::new(
+        "./data/credentials",
+        &master_key,
+    )?;
+    cred_store
+        .get_secret(GROQ_API_KEY_NAME)
+        .context("Groq API key not found. Run bootstrap again.")
 }
