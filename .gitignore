@@ -1,0 +1,26 @@
+# Build artifacts
+/target/
+**/target/
+
+# Runtime state and secrets
+/data/*
+!/data/.gitkeep
+/sandbox/
+
+# Environment files
+.env
+.env.*
+
+# Logs and temp
+*.log
+*.tmp
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor metadata
+.vscode/
+.idea/

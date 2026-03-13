@@ -1,0 +1,8 @@
+[package]
+name = "hypr-claw-interfaces"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio.workspace = true
+async-trait.workspace = true

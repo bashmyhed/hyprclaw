@@ -1,0 +1,21 @@
+[package]
+name = "hypr-claw-providers"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+reqwest = { version = "0.11", features = ["json"] }
+base64 = "0.22"
+sha2 = "0.10"
+rand = "0.8"
+urlencoding = "2.1"
+open = "5.0"
+
+[dev-dependencies]
+hypr-claw-memory = { path = "../memory" }
