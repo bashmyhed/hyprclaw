@@ -322,6 +322,7 @@ mod integration_tests {
             success: true,
             output: Some(json!({"key": "value"})),
             error: None,
+            ..ToolResult::default()
         };
 
         let serialized = serde_json::to_string(&result).unwrap();

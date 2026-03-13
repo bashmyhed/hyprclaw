@@ -414,6 +414,7 @@ fn success_result(output: Value) -> ToolResult {
         success: true,
         output: Some(output),
         error: None,
+        ..ToolResult::default()
     }
 }
 
@@ -422,6 +423,7 @@ fn failure_result(message: String, output: Value) -> ToolResult {
         success: false,
         output: Some(output),
         error: Some(message),
+        ..ToolResult::default()
     }
 }
 

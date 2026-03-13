@@ -107,6 +107,7 @@ impl Tool for ShellExecTool {
             } else {
                 Some(stderr)
             },
+            ..ToolResult::default()
         })
     }
 }

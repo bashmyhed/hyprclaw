@@ -4,6 +4,7 @@ use crate::interfaces::RuntimeError;
 use crate::types::{LLMResponse, Message};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
+use std::error::Error as _;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -47,7 +48,7 @@ struct OpenAIChoice {
 
 #[derive(Debug, Deserialize)]
 struct OpenAIMessage {
-    content: Option<String>,
+    content: Option<serde_json::Value>,
     tool_calls: Option<Vec<OpenAIToolCall>>,
 }
 
@@ -146,6 +147,7 @@ impl LLMClient {
     pub fn new(base_url: String, max_retries: u32) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
+            .user_agent("hypr-claw/0.1")
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
@@ -320,18 +322,21 @@ impl LLMClient {
         messages: &[Message],
         tool_schemas: &[serde_json::Value],
     ) -> Result<LLMResponse, RuntimeError> {
+        self.call_with_tool_requirement(system_prompt, messages, tool_schemas, false)
+            .await
+    }
+
+    pub async fn call_with_tool_requirement(
+        &self,
+        system_prompt: &str,
+        messages: &[Message],
+        tool_schemas: &[serde_json::Value],
+        require_tool_call: bool,
+    ) -> Result<LLMResponse, RuntimeError> {
         let _timer = crate::metrics::MetricTimer::new("llm_request_latency");
 
         // Check circuit breaker
         self.circuit_breaker.should_allow_request()?;
-
-        // CRITICAL: Validate tools are not empty
-        if tool_schemas.is_empty() {
-            return Err(RuntimeError::LLMError(
-                "Cannot call LLM with empty tool schemas. Agent must have tools registered."
-                    .to_string(),
-            ));
-        }
 
         let mut last_error = None;
         let mut attempts_used = 0u32;
@@ -340,7 +345,10 @@ impl LLMClient {
             attempts_used = attempt + 1;
             debug!("LLM call attempt {}/{}", attempt + 1, self.max_retries + 1);
 
-            match self.call_once(system_prompt, messages, tool_schemas).await {
+            match self
+                .call_once(system_prompt, messages, tool_schemas, require_tool_call)
+                .await
+            {
                 Ok(response) => {
                     self.circuit_breaker.record_success();
                     return Ok(response);
@@ -375,6 +383,7 @@ impl LLMClient {
         system_prompt: &str,
         messages: &[Message],
         tool_schemas: &[serde_json::Value],
+        require_tool_call: bool,
     ) -> Result<LLMResponse, RuntimeError> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let active_model = self.current_model();
@@ -469,8 +478,14 @@ impl LLMClient {
             let openai_request = OpenAIRequest {
                 model: model.clone(),
                 messages: openai_messages,
-                tools: Some(tool_schemas.to_vec()),
-                tool_choice: Some("auto".to_string()),
+                tools: (!tool_schemas.is_empty()).then(|| tool_schemas.to_vec()),
+                tool_choice: (!tool_schemas.is_empty()).then(|| {
+                    if require_tool_call {
+                        "required".to_string()
+                    } else {
+                        "auto".to_string()
+                    }
+                }),
                 temperature,
                 top_p,
                 max_tokens,
@@ -501,11 +516,26 @@ impl LLMClient {
         }
 
         let response = req_builder.send().await.map_err(|e| {
-            if e.is_connect() || e.is_timeout() {
-                RuntimeError::LLMError("Network connection failed".to_string())
+            let kind = if e.is_timeout() {
+                "timeout"
+            } else if e.is_connect() {
+                "connect"
+            } else if e.is_body() {
+                "body"
+            } else if e.is_decode() {
+                "decode"
+            } else if e.is_request() {
+                "request"
             } else {
-                RuntimeError::LLMError(format!("HTTP request failed: {}", e))
-            }
+                "unknown"
+            };
+            let source = e
+                .source()
+                .map(|source| source.to_string())
+                .unwrap_or_else(|| "none".to_string());
+            RuntimeError::LLMError(format!(
+                "HTTP transport failed ({kind}) for {url}: {e}; source: {source}"
+            ))
         })?;
 
         let status = response.status();
@@ -571,7 +601,7 @@ impl LLMClient {
                                     .unwrap_or(serde_json::json!({})),
                             }
                         } else {
-                            let content = choice.message.content.clone().unwrap_or_default();
+                            let content = extract_openai_message_content(&choice.message);
                             if let Some((tool_name, input)) = parse_inline_tool_call(&content) {
                                 LLMResponse::ToolCall {
                                     schema_version: crate::types::SCHEMA_VERSION,
@@ -586,7 +616,7 @@ impl LLMClient {
                             }
                         }
                     } else {
-                        let content = choice.message.content.clone().unwrap_or_default();
+                        let content = extract_openai_message_content(&choice.message);
                         if let Some((tool_name, input)) = parse_inline_tool_call(&content) {
                             LLMResponse::ToolCall {
                                 schema_version: crate::types::SCHEMA_VERSION,
@@ -653,6 +683,51 @@ fn extract_retry_seconds(msg: &str) -> Option<u64> {
         num.clear();
     }
     None
+}
+
+fn extract_openai_message_content(message: &OpenAIMessage) -> String {
+    fn value_to_text(value: &serde_json::Value) -> String {
+        match value {
+            serde_json::Value::Null => String::new(),
+            serde_json::Value::String(text) => text.clone(),
+            serde_json::Value::Array(items) => items
+                .iter()
+                .map(value_to_text)
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            serde_json::Value::Object(map) => {
+                for key in ["text", "content", "value", "output_text"] {
+                    if let Some(value) = map.get(key) {
+                        let text = value_to_text(value);
+                        if !text.is_empty() {
+                            return text;
+                        }
+                    }
+                }
+
+                for key in ["parts", "segments"] {
+                    if let Some(value) = map.get(key) {
+                        let text = value_to_text(value);
+                        if !text.is_empty() {
+                            return text;
+                        }
+                    }
+                }
+
+                String::new()
+            }
+            other => other.to_string(),
+        }
+    }
+
+    message
+        .content
+        .as_ref()
+        .map(value_to_text)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
 }
 
 fn parse_inline_tool_call(content: &str) -> Option<(String, serde_json::Value)> {
@@ -781,6 +856,29 @@ mod tests {
             input: json!({"query": "test"}),
         };
         assert!(client.validate_response(&response).is_ok());
+    }
+
+    #[test]
+    fn test_extract_openai_message_content_from_array_parts() {
+        let message = OpenAIMessage {
+            content: Some(json!([
+                {"type": "text", "text": "Hello"},
+                {"type": "text", "text": "world"}
+            ])),
+            tool_calls: None,
+        };
+
+        assert_eq!(extract_openai_message_content(&message), "Hello\nworld");
+    }
+
+    #[test]
+    fn test_extract_openai_message_content_from_nested_content_field() {
+        let message = OpenAIMessage {
+            content: Some(json!({"content": [{"text": "Compose opened"}]})),
+            tool_calls: None,
+        };
+
+        assert_eq!(extract_openai_message_content(&message), "Compose opened");
     }
 
     #[test]

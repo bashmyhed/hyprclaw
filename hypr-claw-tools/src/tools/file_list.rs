@@ -85,6 +85,7 @@ impl Tool for FileListTool {
             success: true,
             output: Some(json!({"entries": entries})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }

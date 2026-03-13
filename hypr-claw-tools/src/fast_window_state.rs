@@ -103,6 +103,7 @@ impl Tool for DesktopFastWindowStateTool {
             success: true,
             output: Some(state),
             error: None,
+            ..ToolResult::default()
         })
     }
 }

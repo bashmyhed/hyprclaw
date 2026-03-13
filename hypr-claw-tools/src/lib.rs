@@ -3,9 +3,11 @@ pub mod dispatcher;
 pub mod error;
 pub mod execution_context;
 pub mod fast_window_state;
+pub mod imported;
 pub mod os_capabilities;
 pub mod os_tools;
 pub mod permission_adapter;
+pub mod pipeline;
 pub mod registry;
 pub mod runtime_health;
 pub mod sandbox;
@@ -17,6 +19,10 @@ pub use dispatcher::ToolDispatcherImpl;
 pub use error::ToolError;
 pub use execution_context::ExecutionContext;
 pub use fast_window_state::DesktopFastWindowStateTool;
+pub use imported::{
+    Fs2AppendTool, Fs2EditTool, Fs2ListTool, Fs2ReadTool, Fs2WriteTool,
+    HiddenToolSearchBm25Tool, HiddenToolSearchRegexTool,
+};
 pub use registry::ToolRegistryImpl;
 pub use runtime_health::{probe_runtime_health, BackendStatus, RuntimeHealthSnapshot};
 pub use tools::{Tool, ToolResult};

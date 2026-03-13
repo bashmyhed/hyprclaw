@@ -19,8 +19,28 @@ impl LLMClientType {
         messages: &[Message],
         tool_schemas: &[serde_json::Value],
     ) -> Result<LLMResponse, RuntimeError> {
+        self.call_with_tool_requirement(system_prompt, messages, tool_schemas, false)
+            .await
+    }
+
+    pub async fn call_with_tool_requirement(
+        &self,
+        system_prompt: &str,
+        messages: &[Message],
+        tool_schemas: &[serde_json::Value],
+        require_tool_call: bool,
+    ) -> Result<LLMResponse, RuntimeError> {
         match self {
-            Self::Standard(client) => client.call(system_prompt, messages, tool_schemas).await,
+            Self::Standard(client) => {
+                client
+                    .call_with_tool_requirement(
+                        system_prompt,
+                        messages,
+                        tool_schemas,
+                        require_tool_call,
+                    )
+                    .await
+            }
             Self::Codex(adapter) => adapter.call(system_prompt, messages, tool_schemas).await,
         }
     }

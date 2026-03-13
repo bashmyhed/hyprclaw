@@ -58,6 +58,7 @@ impl Tool for FsCreateDirTool {
             success: true,
             output: Some(json!({"created": path})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -90,6 +91,7 @@ impl Tool for FsDeleteTool {
             success: true,
             output: Some(json!({"deleted": path})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -126,6 +128,7 @@ impl Tool for FsMoveTool {
             success: true,
             output: Some(json!({"from": from, "to": to})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -162,6 +165,7 @@ impl Tool for FsCopyTool {
             success: true,
             output: Some(json!({"from": from, "to": to})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -194,6 +198,7 @@ impl Tool for FsReadTool {
             success: true,
             output: Some(json!({"path": path, "content": content})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -230,6 +235,7 @@ impl Tool for FsWriteTool {
             success: true,
             output: Some(json!({"written": path})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -266,6 +272,7 @@ impl Tool for FsListTool {
             success: true,
             output: Some(json!({"path": path, "entries": entries})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -287,6 +294,7 @@ pub struct DesktopHealthStatusTool;
 pub struct DesktopActiveWindowTool;
 pub struct DesktopListWindowsTool;
 pub struct DesktopMouseMoveTool;
+pub struct DesktopClickTool;
 pub struct DesktopClickAtTool;
 pub struct DesktopOcrScreenTool;
 pub struct DesktopFindTextTool;
@@ -337,6 +345,7 @@ impl Tool for ProcSpawnTool {
             success: true,
             output: Some(json!({"pid": pid})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -369,6 +378,7 @@ impl Tool for ProcKillTool {
             success: true,
             output: Some(json!({"killed": pid})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -403,6 +413,7 @@ impl Tool for ProcListTool {
             success: true,
             output: Some(json!({"processes": procs})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -437,6 +448,7 @@ impl Tool for DesktopOpenUrlTool {
             success: true,
             output: Some(json!({"opened": url})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -480,6 +492,7 @@ impl Tool for DesktopLaunchAppTool {
             success: true,
             output: Some(json!({"app": app, "pid": pid})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -539,6 +552,7 @@ impl Tool for DesktopLaunchAppAndWaitTextTool {
             success: true,
             output: Some(json!({"app": app, "pid": pid, "query": query, "match": found})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -575,6 +589,7 @@ impl Tool for DesktopSearchWebTool {
             success: true,
             output: Some(json!({"query": query, "url": url})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -609,6 +624,7 @@ impl Tool for DesktopOpenGmailTool {
             success: true,
             output: Some(json!({"opened": "https://mail.google.com"})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -641,6 +657,7 @@ impl Tool for DesktopTypeTextTool {
             success: true,
             output: Some(json!({"typed": text.len()})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -673,6 +690,7 @@ impl Tool for DesktopKeyPressTool {
             success: true,
             output: Some(json!({"pressed": key})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -719,6 +737,7 @@ impl Tool for DesktopKeyComboTool {
             success: true,
             output: Some(json!({"combo": keys})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -753,6 +772,7 @@ impl Tool for DesktopMouseClickTool {
             success: true,
             output: Some(json!({"clicked": button})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -784,6 +804,7 @@ impl Tool for DesktopCaptureScreenTool {
             success: true,
             output: Some(json!({"path": saved})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -818,6 +839,7 @@ impl Tool for DesktopActiveWindowTool {
             success: true,
             output: Some(json!({"window": window})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -853,6 +875,7 @@ impl Tool for DesktopHealthStatusTool {
             success: true,
             output: Some(output),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -884,6 +907,7 @@ impl Tool for DesktopListWindowsTool {
             success: true,
             output: Some(json!({"windows": windows})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -920,6 +944,7 @@ impl Tool for DesktopMouseMoveTool {
             success: true,
             output: Some(json!({"x": x, "y": y})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -958,6 +983,7 @@ impl Tool for DesktopClickAtTool {
             success: true,
             output: Some(json!({"x": x, "y": y, "button": button})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -993,6 +1019,7 @@ impl Tool for DesktopOcrScreenTool {
             success: true,
             output: Some(json!({"text": text, "matches": words})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -1033,6 +1060,7 @@ impl Tool for DesktopFindTextTool {
             success: true,
             output: Some(json!({"query": query, "matches": matches})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -1075,6 +1103,7 @@ impl Tool for DesktopClickTextTool {
             success: true,
             output: Some(json!({"query": query, "target": target, "button": button})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -1119,6 +1148,7 @@ impl Tool for DesktopWaitForTextTool {
             success: true,
             output: Some(json!({"query": query, "match": found})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -1153,6 +1183,7 @@ impl Tool for DesktopCursorPositionTool {
             success: true,
             output: Some(json!({"x": x, "y": y})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -1193,6 +1224,89 @@ impl Tool for DesktopMouseMoveAndVerifyTool {
             success: true,
             output: Some(json!({"target": {"x": x, "y": y}, "verified": {"x": vx, "y": vy}})),
             error: None,
+            ..ToolResult::default()
+        })
+    }
+}
+
+#[async_trait]
+impl Tool for DesktopClickTool {
+    fn name(&self) -> &'static str {
+        "desktop.click"
+    }
+    fn description(&self) -> &'static str {
+        "Click by visible text or coordinates using verified cursor movement by default"
+    }
+    fn permission_tier(&self) -> PermissionTier {
+        PermissionTier::Execute
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "occurrence": {"type": "number"},
+                "x": {"type": "number"},
+                "y": {"type": "number"},
+                "button": {"type": "string", "enum": ["left", "middle", "right"]},
+                "case_sensitive": {"type": "boolean"},
+                "lang": {"type": "string"},
+                "tolerance": {"type": "number"},
+                "timeout_ms": {"type": "number"}
+            },
+            "anyOf": [
+                {"required": ["query"]},
+                {"required": ["x", "y"]}
+            ],
+            "additionalProperties": false
+        })
+    }
+    async fn execute(&self, _ctx: ExecutionContext, input: Value) -> Result<ToolResult, ToolError> {
+        let button = input["button"].as_str().unwrap_or("left");
+        let tolerance = input["tolerance"].as_i64().unwrap_or(8) as i32;
+        let timeout_ms = input["timeout_ms"].as_u64().unwrap_or(900);
+        let result = if input.get("query").and_then(|value| value.as_str()).is_some() {
+            let query = required_str(&input, "query")?;
+            let occurrence = input["occurrence"].as_u64().unwrap_or(0) as usize;
+            let case_sensitive = input["case_sensitive"].as_bool().unwrap_or(false);
+            let lang = input["lang"].as_str();
+            let matches = desktop::find_text(query, case_sensitive, occurrence + 1, lang)
+                .await
+                .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+            let target = matches.get(occurrence).cloned().ok_or_else(|| {
+                ToolError::ExecutionFailed(format!("text '{}' not found on screen", query))
+            })?;
+            let clicked = desktop::click_at_and_verify(
+                target.center_x,
+                target.center_y,
+                button,
+                tolerance,
+                timeout_ms,
+            )
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+            json!({
+                "mode": "text",
+                "query": query,
+                "target": target,
+                "click": clicked
+            })
+        } else {
+            let x = required_u32(&input, "x")? as i32;
+            let y = required_u32(&input, "y")? as i32;
+            let clicked = desktop::click_at_and_verify(x, y, button, tolerance, timeout_ms)
+                .await
+                .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+            json!({
+                "mode": "coordinates",
+                "click": clicked
+            })
+        };
+        Ok(ToolResult {
+            success: true,
+            output: Some(result),
+            error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -1235,6 +1349,7 @@ impl Tool for DesktopClickAtAndVerifyTool {
             success: true,
             output: Some(result),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -1290,6 +1405,7 @@ impl Tool for DesktopReadScreenStateTool {
             success: true,
             output: Some(state),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -1329,6 +1445,7 @@ impl Tool for HyprWorkspaceSwitchTool {
             success: true,
             output: Some(json!({"workspace": workspace_id})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -1365,6 +1482,7 @@ impl Tool for HyprWorkspaceMoveWindowTool {
             success: true,
             output: Some(json!({"window_id": window_id, "workspace_id": workspace_id})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -1397,6 +1515,7 @@ impl Tool for HyprWindowFocusTool {
             success: true,
             output: Some(json!({"focused": window_id})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -1429,6 +1548,7 @@ impl Tool for HyprWindowCloseTool {
             success: true,
             output: Some(json!({"closed": window_id})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -1465,6 +1585,7 @@ impl Tool for HyprWindowMoveTool {
             success: true,
             output: Some(json!({"window_id": window_id, "workspace_id": workspace_id})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -1497,6 +1618,7 @@ impl Tool for HyprExecTool {
             success: true,
             output: Some(json!({"executed": command})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -1535,6 +1657,7 @@ impl Tool for WallpaperSetTool {
             success: true,
             output: Some(json!({"wallpaper": image_path})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -1569,6 +1692,7 @@ impl Tool for SystemShutdownTool {
             success: true,
             output: Some(json!({"shutdown": true})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -1603,6 +1727,7 @@ impl Tool for SystemRebootTool {
             success: true,
             output: Some(json!({"reboot": true})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -1637,6 +1762,7 @@ impl Tool for SystemBatteryTool {
             success: true,
             output: Some(json!({"battery_percent": percent})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
@@ -1671,6 +1797,7 @@ impl Tool for SystemMemoryTool {
             success: true,
             output: Some(json!({"memory": info})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }

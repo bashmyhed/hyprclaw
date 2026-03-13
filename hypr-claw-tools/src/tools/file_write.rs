@@ -96,6 +96,7 @@ impl Tool for FileWriteTool {
             success: true,
             output: Some(json!({"written": true})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }

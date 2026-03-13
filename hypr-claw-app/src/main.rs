@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 pub mod bootstrap;
 pub mod config;
+pub mod debug_notify;
 pub mod scan;
 
 use config::{Config, LLMProvider};
@@ -55,9 +56,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse CLI arguments
     let raw_args: Vec<String> = std::env::args().collect();
     let debug_mode = raw_args.iter().any(|arg| arg == "--debug" || arg == "-d");
+    let debug_notify = raw_args.iter().any(|arg| arg == "--debug-notify")
+        || std::env::var("HYPR_CLAW_DEBUG_NOTIFY")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
     let args: Vec<String> = raw_args
         .into_iter()
-        .filter(|arg| arg != "--debug" && arg != "-d")
+        .filter(|arg| arg != "--debug" && arg != "-d" && arg != "--debug-notify")
         .collect();
     if args.len() > 1 && args[1] == "config" && args.get(2).map(|s| s.as_str()) == Some("reset") {
         return handle_config_reset();
@@ -127,9 +132,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     if matches!(config.provider, LLMProvider::Nvidia)
-        && (config.model.trim().is_empty() || config.model == "moonshotai/kimi-k2.5")
+        && (config.model.trim().is_empty()
+            || config.model == "moonshotai/kimi-k2.5"
+            || config.model == "z-ai/glm4.7")
     {
-        config.model = "z-ai/glm4.7".to_string();
+        config.model = "z-ai/glm5".to_string();
         let _ = config.save();
         println!("ℹ️  NVIDIA default model set to {}", config.model);
     }
@@ -236,71 +243,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let async_session = Arc::new(hypr_claw_runtime::AsyncSessionStore::new(session_store));
     let async_locks = Arc::new(hypr_claw_runtime::AsyncLockManager::new(lock_manager));
 
-    // Create tool registry
-    let mut registry = hypr_claw_tools::ToolRegistryImpl::new();
-    registry.register(Arc::new(hypr_claw_tools::tools::EchoTool));
-
-    // Register OS capability tools
-    registry.register(Arc::new(hypr_claw_tools::os_tools::FsCreateDirTool));
-    registry.register(Arc::new(hypr_claw_tools::os_tools::FsDeleteTool));
-    registry.register(Arc::new(hypr_claw_tools::os_tools::FsMoveTool));
-    registry.register(Arc::new(hypr_claw_tools::os_tools::FsCopyTool));
-    registry.register(Arc::new(hypr_claw_tools::os_tools::FsReadTool));
-    registry.register(Arc::new(hypr_claw_tools::os_tools::FsWriteTool));
-    registry.register(Arc::new(hypr_claw_tools::os_tools::FsListTool));
-    registry.register(Arc::new(hypr_claw_tools::os_tools::HyprWorkspaceSwitchTool));
-    hypr_claw_tools::register_workspace_tools(&mut registry);
-    registry.register(Arc::new(
-        hypr_claw_tools::os_tools::HyprWorkspaceMoveWindowTool,
-    ));
-    registry.register(Arc::new(hypr_claw_tools::os_tools::HyprWindowFocusTool));
-    registry.register(Arc::new(hypr_claw_tools::os_tools::HyprWindowCloseTool));
-    registry.register(Arc::new(hypr_claw_tools::os_tools::HyprWindowMoveTool));
-    registry.register(Arc::new(hypr_claw_tools::os_tools::HyprExecTool));
-    registry.register(Arc::new(hypr_claw_tools::os_tools::ProcSpawnTool));
-    registry.register(Arc::new(hypr_claw_tools::os_tools::ProcKillTool));
-    registry.register(Arc::new(hypr_claw_tools::os_tools::ProcListTool));
-    registry.register(Arc::new(hypr_claw_tools::os_tools::DesktopOpenUrlTool));
-    registry.register(Arc::new(hypr_claw_tools::os_tools::DesktopLaunchAppTool));
-    registry.register(Arc::new(
-        hypr_claw_tools::os_tools::DesktopLaunchAppAndWaitTextTool,
-    ));
-    registry.register(Arc::new(hypr_claw_tools::os_tools::DesktopSearchWebTool));
-    registry.register(Arc::new(hypr_claw_tools::os_tools::DesktopOpenGmailTool));
-    registry.register(Arc::new(hypr_claw_tools::os_tools::DesktopTypeTextTool));
-    registry.register(Arc::new(hypr_claw_tools::os_tools::DesktopKeyPressTool));
-    registry.register(Arc::new(hypr_claw_tools::os_tools::DesktopKeyComboTool));
-    registry.register(Arc::new(hypr_claw_tools::os_tools::DesktopMouseClickTool));
-    registry.register(Arc::new(
-        hypr_claw_tools::os_tools::DesktopCaptureScreenTool,
-    ));
-    registry.register(Arc::new(hypr_claw_tools::os_tools::DesktopHealthStatusTool));
-    registry.register(Arc::new(hypr_claw_tools::DesktopFastWindowStateTool));
-    registry.register(Arc::new(hypr_claw_tools::os_tools::DesktopActiveWindowTool));
-    registry.register(Arc::new(hypr_claw_tools::os_tools::DesktopListWindowsTool));
-    registry.register(Arc::new(hypr_claw_tools::os_tools::DesktopMouseMoveTool));
-    registry.register(Arc::new(hypr_claw_tools::os_tools::DesktopClickAtTool));
-    registry.register(Arc::new(hypr_claw_tools::os_tools::DesktopOcrScreenTool));
-    registry.register(Arc::new(hypr_claw_tools::os_tools::DesktopFindTextTool));
-    registry.register(Arc::new(hypr_claw_tools::os_tools::DesktopClickTextTool));
-    registry.register(Arc::new(hypr_claw_tools::os_tools::DesktopWaitForTextTool));
-    registry.register(Arc::new(
-        hypr_claw_tools::os_tools::DesktopCursorPositionTool,
-    ));
-    registry.register(Arc::new(
-        hypr_claw_tools::os_tools::DesktopMouseMoveAndVerifyTool,
-    ));
-    registry.register(Arc::new(
-        hypr_claw_tools::os_tools::DesktopClickAtAndVerifyTool,
-    ));
-    registry.register(Arc::new(
-        hypr_claw_tools::os_tools::DesktopReadScreenStateTool,
-    ));
-    registry.register(Arc::new(hypr_claw_tools::os_tools::WallpaperSetTool));
-    registry.register(Arc::new(hypr_claw_tools::os_tools::SystemShutdownTool));
-    registry.register(Arc::new(hypr_claw_tools::os_tools::SystemRebootTool));
-    registry.register(Arc::new(hypr_claw_tools::os_tools::SystemBatteryTool));
-    registry.register(Arc::new(hypr_claw_tools::os_tools::SystemMemoryTool));
+    let registry = hypr_claw_app::tool_setup::build_tool_registry()?;
 
     let registry_arc = Arc::new(registry);
 
@@ -434,6 +377,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         compactor,
         active_soul.max_iterations,
     );
+    if debug_notify {
+        agent_loop.set_debug_observer(Arc::new(
+            hypr_claw_app::debug_notify::DesktopNotificationObserver::new(true),
+        ));
+    }
 
     // Run REPL loop
     let system_prompt = active_soul.system_prompt.clone();
@@ -2026,6 +1974,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         err_msg.contains("Tool invocation required but not performed");
                     let is_provider_argument_error =
                         err_msg.contains("INVALID_ARGUMENT") || err_msg.contains("400 Bad Request");
+                    let is_provider_transport_error = err_lower.contains("http transport failed")
+                        || err_lower.contains("dns error")
+                        || err_lower.contains("network connection failed")
+                        || err_lower.contains("authentication failed")
+                        || err_lower.contains("server error:");
+                    let is_empty_final_content_error =
+                        err_lower.contains("final response has empty content");
                     let is_watchdog_timeout_error =
                         err_msg.to_lowercase().contains("watchdog timeout");
                     let is_max_iterations_error = err_msg.contains("Max iterations")
@@ -2049,6 +2004,90 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     recovery_notes.push(note.clone());
                     println!("{note}");
+
+                    if matches!(config.provider, LLMProvider::Nvidia)
+                        && (is_watchdog_timeout_error || is_provider_transport_error)
+                    {
+                        if let Some(current_model) = agent_loop.current_model() {
+                            if let Some(next_model) =
+                                nvidia_model_fallbacks(&current_model).into_iter().next()
+                            {
+                                agent_state.reliability.last_stage =
+                                    "recovery_provider_model_fallback".to_string();
+                                let fallback_note = format!(
+                                    "[recovery {}/{}] switching NVIDIA model {} -> {}",
+                                    fallback_attempts,
+                                    MAX_RECOVERY_ATTEMPTS,
+                                    current_model,
+                                    next_model
+                                );
+                                recovery_notes.push(fallback_note.clone());
+                                println!("{fallback_note}");
+                                if let Err(e) = agent_loop.set_model(next_model) {
+                                    let fail_note = format!(
+                                        "[recovery {}/{}] model switch failed: {}",
+                                        fallback_attempts, MAX_RECOVERY_ATTEMPTS, e
+                                    );
+                                    recovery_notes.push(fail_note.clone());
+                                    println!("{fail_note}");
+                                } else {
+                                    run_result = run_with_interrupt_and_timeout(
+                                        &agent_loop,
+                                        &task_session_key,
+                                        &agent_name,
+                                        &turn_system_prompt,
+                                        &effective_input,
+                                        &interrupt,
+                                        watchdog_timeout,
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
+                    if matches!(config.provider, LLMProvider::Google)
+                        && is_empty_final_content_error
+                    {
+                        if let Some(current_model) = agent_loop.current_model() {
+                            if let Some(next_model) =
+                                google_model_fallbacks(&current_model).into_iter().next()
+                            {
+                                agent_state.reliability.last_stage =
+                                    "recovery_provider_model_fallback".to_string();
+                                let fallback_note = format!(
+                                    "[recovery {}/{}] switching Google model {} -> {}",
+                                    fallback_attempts,
+                                    MAX_RECOVERY_ATTEMPTS,
+                                    current_model,
+                                    next_model
+                                );
+                                recovery_notes.push(fallback_note.clone());
+                                println!("{fallback_note}");
+                                if let Err(e) = agent_loop.set_model(next_model) {
+                                    let fail_note = format!(
+                                        "[recovery {}/{}] model switch failed: {}",
+                                        fallback_attempts, MAX_RECOVERY_ATTEMPTS, e
+                                    );
+                                    recovery_notes.push(fail_note.clone());
+                                    println!("{fail_note}");
+                                } else {
+                                    run_result = run_with_interrupt_and_timeout(
+                                        &agent_loop,
+                                        &task_session_key,
+                                        &agent_name,
+                                        &turn_system_prompt,
+                                        &effective_input,
+                                        &interrupt,
+                                        watchdog_timeout,
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
 
                     if is_tool_enforcement_error {
                         agent_state.reliability.last_stage = "recovery_tool_enforcement".to_string();
@@ -3622,8 +3661,8 @@ fn print_status_panel(
 
 fn model_priority(model_id: &str) -> usize {
     match model_id {
-        "z-ai/glm4.7" => 0,
-        "z-ai/glm5" => 1,
+        "z-ai/glm5" => 0,
+        "z-ai/glm4.7" => 1,
         "moonshotai/kimi-k2.5" => 2,
         "moonshotai/kimi-k2-instruct-0905" => 3,
         "qwen/qwen3-coder-480b-a35b-instruct" => 4,
@@ -3671,8 +3710,8 @@ fn print_model_recommendations(provider: &LLMProvider, current_model: &str) {
         LLMProvider::Nvidia => {
             println!("\nRecommended NVIDIA models for agentic tasks:");
             let recommendations = [
-                "z-ai/glm4.7",
                 "z-ai/glm5",
+                "z-ai/glm4.7",
                 "moonshotai/kimi-k2.5",
                 "qwen/qwen3-coder-480b-a35b-instruct",
                 "meta/llama-4-maverick-17b-128e-instruct",
@@ -3719,10 +3758,26 @@ where
         .map_err(|e| e.to_string())?;
 
     println!("✅ Model switched to {}", model_id);
-    if model_id == "z-ai/glm4.7" {
+    if model_id == "z-ai/glm5" {
+        println!("ℹ️  GLM-5 profile enabled.");
+    } else if model_id == "z-ai/glm4.7" {
         println!("ℹ️  GLM-4.7 profile enabled (agentic terminal tuning).");
     }
     Ok(())
+}
+
+fn nvidia_model_fallbacks(current_model: &str) -> Vec<&'static str> {
+    ["z-ai/glm5", "z-ai/glm4.7", "moonshotai/kimi-k2.5"]
+        .into_iter()
+        .filter(|candidate| *candidate != current_model)
+        .collect()
+}
+
+fn google_model_fallbacks(current_model: &str) -> Vec<&'static str> {
+    ["gemini-2.5-pro", "gemini-2.5-flash"]
+        .into_iter()
+        .filter(|candidate| *candidate != current_model)
+        .collect()
 }
 
 async fn run_with_interrupt_and_timeout<S, L, D, R, Sum>(
@@ -6155,16 +6210,15 @@ impl hypr_claw_runtime::ToolDispatcher for RuntimeDispatcherAdapter {
         match result {
             Ok(tool_result) => {
                 let elapsed = started.elapsed().as_millis();
-                if tool_result.success {
-                    let output = tool_result.output.unwrap_or(serde_json::json!({}));
+                if tool_result.is_effective_success() {
+                    let output = tool_result.llm_payload();
                     let line = self.tool_success_line(&normalized_tool_name, elapsed);
                     self.print_action(session_key, &line);
                     self.print_debug_payload("output", &output);
                     Ok(output)
                 } else {
                     let base_detail = tool_result
-                        .error
-                        .clone()
+                        .effective_error_message()
                         .unwrap_or_else(|| "Unknown error".to_string());
                     let alternatives = fallback_tools_for_tool(&normalized_tool_name);
                     let detail = if alternatives.is_empty() {

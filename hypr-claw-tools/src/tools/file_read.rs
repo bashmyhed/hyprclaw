@@ -69,6 +69,7 @@ impl Tool for FileReadTool {
             success: true,
             output: Some(json!({"content": content})),
             error: None,
+            ..ToolResult::default()
         })
     }
 }

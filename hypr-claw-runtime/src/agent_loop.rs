@@ -1,13 +1,28 @@
 //! Agent loop - the core runtime kernel.
 
 use crate::compactor::{Compactor, Summarizer};
+use crate::debug::{DebugEvent, DebugObserver, NoopDebugObserver};
 use crate::interfaces::{LockManager, RuntimeError, SessionStore, ToolDispatcher, ToolRegistry};
 use crate::llm_client_type::LLMClientType;
 use crate::types::{LLMResponse, Message, Role};
+use serde::Deserialize;
 use serde_json::json;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tracing::{debug, error, info, warn};
+
+#[derive(Debug)]
+enum RequestRoute {
+    DirectAnswer(String),
+    UseTools,
+}
+
+#[derive(Debug, Deserialize)]
+struct RoutingDecision {
+    needs_tools: bool,
+    #[serde(default)]
+    assistant_reply: Option<String>,
+}
 
 /// Core agent execution loop.
 pub struct AgentLoop<S, L, D, R, Sum>
@@ -25,6 +40,7 @@ where
     llm_client: LLMClientType,
     compactor: Compactor<Sum>,
     max_iterations: Arc<AtomicUsize>,
+    debug_observer: Arc<RwLock<Arc<dyn DebugObserver>>>,
 }
 
 impl<S, L, D, R, Sum> AgentLoop<S, L, D, R, Sum>
@@ -54,6 +70,19 @@ where
             llm_client,
             compactor,
             max_iterations: Arc::new(AtomicUsize::new(max_iterations.max(1))),
+            debug_observer: Arc::new(RwLock::new(Arc::new(NoopDebugObserver))),
+        }
+    }
+
+    pub fn set_debug_observer(&self, observer: Arc<dyn DebugObserver>) {
+        if let Ok(mut slot) = self.debug_observer.write() {
+            *slot = observer;
+        }
+    }
+
+    fn emit_debug_event(&self, event: DebugEvent) {
+        if let Ok(observer) = self.debug_observer.read() {
+            observer.on_event(&event);
         }
     }
 
@@ -99,6 +128,11 @@ where
         system_prompt: &str,
         user_message: &str,
     ) -> Result<String, RuntimeError> {
+        self.emit_debug_event(DebugEvent::RunStarted {
+            session_key: session_key.to_string(),
+            agent_id: agent_id.to_string(),
+            user_message: user_message.to_string(),
+        });
         // Acquire lock
         info!("Acquiring lock for session: {}", session_key);
         self.lock_manager.acquire(session_key).await?;
@@ -107,6 +141,12 @@ where
         let result = self
             .run_inner(session_key, agent_id, system_prompt, user_message)
             .await;
+
+        if let Err(error) = &result {
+            self.emit_debug_event(DebugEvent::RunError {
+                message: error.to_string(),
+            });
+        }
 
         // Release lock
         info!("Releasing lock for session: {}", session_key);
@@ -132,11 +172,24 @@ where
         // Append user message
         messages.push(Message::new(Role::User, json!(user_message)));
 
+        let action_requires_tool = match self
+            .route_request(system_prompt, &messages, user_message)
+            .await?
+        {
+            RequestRoute::DirectAnswer(answer) => {
+                messages.push(Message::new(Role::Assistant, json!(answer.clone())));
+                debug!("Saving session: {}", session_key);
+                self.session_store.save(session_key, &messages).await?;
+                return Ok(answer);
+            }
+            RequestRoute::UseTools => true,
+        };
+
         // Get available tool schemas
         let tool_schemas = self.tool_registry.get_tool_schemas(agent_id);
 
-        // CRITICAL: Fail early if no tools available
-        if tool_schemas.is_empty() {
+        // CRITICAL: Fail early only when the prompt actually needs tools.
+        if action_requires_tool && tool_schemas.is_empty() {
             warn!("No tools available for agent: {}", agent_id);
             return Err(RuntimeError::LLMError(
                 "Agent has no tools registered. Cannot execute OS operations.".to_string(),
@@ -156,7 +209,12 @@ where
                 system_prompt,
                 user_message,
                 &mut messages,
-                &tool_schemas,
+                action_requires_tool,
+                if action_requires_tool {
+                    &tool_schemas
+                } else {
+                    &[]
+                },
             )
             .await?;
 
@@ -174,8 +232,9 @@ where
         &self,
         session_key: &str,
         system_prompt: &str,
-        user_message: &str,
+        _user_message: &str,
         messages: &mut Vec<Message>,
+        action_requires_tool: bool,
         tool_schemas: &[serde_json::Value],
     ) -> Result<String, RuntimeError> {
         // Reinforce system prompt with tool capability
@@ -190,13 +249,15 @@ where
             })
             .collect();
 
-        let reinforced_prompt = format!(
-            "{}\n\nYou are a local autonomous Linux agent. You MUST use tools to perform file, process, wallpaper, or system operations. Do not describe actions — call the appropriate tool.\n\nAvailable tools: {}",
-            system_prompt,
-            tool_names.join(", ")
-        );
-
-        let action_requires_tool = requires_tool_call_for_user_message(user_message);
+        let reinforced_prompt = if action_requires_tool && !tool_names.is_empty() {
+            format!(
+                "{}\n\nYou are a local autonomous Linux agent. You MUST use tools to perform file, process, wallpaper, or system operations. Do not describe actions — call the appropriate tool.\n\nAvailable tools: {}",
+                system_prompt,
+                tool_names.join(", ")
+            )
+        } else {
+            system_prompt.to_string()
+        };
         let mut saw_tool_call = false;
         let mut successful_tool_calls = 0usize;
         let mut tool_call_count = 0usize;
@@ -208,13 +269,22 @@ where
 
         for iteration in 0..max_iterations {
             debug!("LLM loop iteration {}/{}", iteration + 1, max_iterations);
+            self.emit_debug_event(DebugEvent::LlmRequest {
+                iteration: iteration + 1,
+                tool_count: tool_schemas.len(),
+            });
 
             // Call LLM with reinforced prompt
             let llm_start = std::time::Instant::now();
 
             let response = self
                 .llm_client
-                .call(&reinforced_prompt, messages, tool_schemas)
+                .call_with_tool_requirement(
+                    &reinforced_prompt,
+                    messages,
+                    tool_schemas,
+                    action_requires_tool,
+                )
                 .await
                 .map_err(|e| {
                     error!("LLM call failed: {}", e);
@@ -242,6 +312,10 @@ where
                         "LLM returned final response after {} iterations",
                         iteration + 1
                     );
+                    self.emit_debug_event(DebugEvent::LlmFinal {
+                        iteration: iteration + 1,
+                        content: content.clone(),
+                    });
                     return Ok(content);
                 }
                 LLMResponse::ToolCall {
@@ -269,6 +343,11 @@ where
                         )));
                     }
                     info!("LLM requested tool: {}", tool_name);
+                    self.emit_debug_event(DebugEvent::ToolCallRequested {
+                        iteration: iteration + 1,
+                        tool_name: tool_name.clone(),
+                        input: input.clone(),
+                    });
 
                     // Append tool call message
                     messages.push(Message::with_metadata(
@@ -292,6 +371,10 @@ where
                         Err(e) => {
                             tool_failed = true;
                             warn!("Tool execution failed: {}", e);
+                            self.emit_debug_event(DebugEvent::ToolFailure {
+                                tool_name: tool_name.clone(),
+                                error: e.to_string(),
+                            });
                             json!({"error": e.to_string()})
                         }
                     };
@@ -301,6 +384,15 @@ where
                     if let Some(err) = tool_result.get("error").and_then(|v| v.as_str()) {
                         tool_failed = true;
                         last_tool_error = Some(err.to_string());
+                        self.emit_debug_event(DebugEvent::ToolFailure {
+                            tool_name: tool_name.clone(),
+                            error: err.to_string(),
+                        });
+                    } else {
+                        self.emit_debug_event(DebugEvent::ToolResult {
+                            tool_name: tool_name.clone(),
+                            result: tool_result.clone(),
+                        });
                     }
                     if tool_failed {
                         consecutive_tool_failures += 1;
@@ -343,6 +435,61 @@ where
             max_iterations
         )))
     }
+
+    async fn route_request(
+        &self,
+        system_prompt: &str,
+        messages: &[Message],
+        user_message: &str,
+    ) -> Result<RequestRoute, RuntimeError> {
+        let router_prompt = format!(
+            "{}\n\nYou are the request router for a Linux desktop agent. Decide whether the user's latest request requires tool use.\nReturn strict JSON only with this shape: {{\"needs_tools\": boolean, \"assistant_reply\": string}}.\nSet needs_tools=false only for requests that can be answered directly without interacting with the OS, tools, files, apps, or live desktop state.\nIf needs_tools=false, provide a short assistant_reply.\nIf needs_tools=true, assistant_reply should be an empty string.",
+            system_prompt
+        );
+
+        let response = self.llm_client.call(&router_prompt, messages, &[]).await?;
+        match response {
+            LLMResponse::ToolCall { .. } => Ok(RequestRoute::UseTools),
+            LLMResponse::Final { content, .. } => {
+                let parsed = parse_routing_decision(&content);
+                match parsed {
+                    Some(decision) if decision.needs_tools => Ok(RequestRoute::UseTools),
+                    Some(decision) => {
+                        let answer = decision
+                            .assistant_reply
+                            .map(|reply| reply.trim().to_string())
+                            .filter(|reply| !reply.is_empty())
+                            .unwrap_or_else(|| content.trim().to_string());
+                        Ok(RequestRoute::DirectAnswer(answer))
+                    }
+                    None => {
+                        if requires_tool_call_for_user_message(user_message) {
+                            Ok(RequestRoute::UseTools)
+                        } else {
+                            Ok(RequestRoute::DirectAnswer(content.trim().to_string()))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn parse_routing_decision(content: &str) -> Option<RoutingDecision> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let raw = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .map(|value| value.trim())
+        .and_then(|value| value.strip_suffix("```"))
+        .map(str::trim)
+        .unwrap_or(trimmed);
+
+    serde_json::from_str(raw).ok()
 }
 
 fn requires_tool_call_for_user_message(user_message: &str) -> bool {

@@ -9,12 +9,20 @@ mod tests {
 
     // Mock implementations for testing
     struct MockPermissionEngine;
+    struct MockApprovalPermissionEngine;
     struct MockAuditLogger;
 
     #[async_trait]
     impl PermissionEngine for MockPermissionEngine {
         async fn check(&self, _request: PermissionRequest) -> PermissionDecision {
             PermissionDecision::Allow
+        }
+    }
+
+    #[async_trait]
+    impl PermissionEngine for MockApprovalPermissionEngine {
+        async fn check(&self, _request: PermissionRequest) -> PermissionDecision {
+            PermissionDecision::RequireApproval("Need confirmation".to_string())
         }
     }
 
@@ -248,11 +256,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_dispatcher_approval_required_result_is_normalized() {
+        let mut registry = ToolRegistryImpl::new();
+        registry.register(Arc::new(EchoTool));
+
+        let dispatcher = ToolDispatcherImpl::new(
+            Arc::new(registry),
+            Arc::new(MockApprovalPermissionEngine) as Arc<dyn PermissionEngine>,
+            Arc::new(MockAuditLogger) as Arc<dyn AuditLogger>,
+            5000,
+        );
+
+        let result = dispatcher
+            .dispatch("session".into(), "echo".into(), json!({"message": "test"}))
+            .await
+            .unwrap();
+
+        assert!(!result.is_effective_success());
+        assert!(result.is_error);
+        assert_eq!(result.error_kind.as_deref(), Some("approval_required"));
+        assert_eq!(result.user_message(), Some("Need confirmation"));
+        assert_eq!(result.output, Some(json!({
+            "approval_required": true,
+            "message": "Need confirmation"
+        })));
+    }
+
+    #[test]
+    fn test_tool_result_prefers_explicit_llm_payload() {
+        let result = ToolResult {
+            success: true,
+            output: Some(json!({"legacy": true})),
+            for_llm: Some(json!({"normalized": true})),
+            ..ToolResult::default()
+        };
+
+        assert_eq!(result.llm_payload(), json!({"normalized": true}));
+        assert!(result.is_effective_success());
+    }
+
+    #[test]
+    fn test_tool_result_failure_helper_sets_error_semantics() {
+        let result = ToolResult::failure("boom");
+
+        assert!(!result.is_effective_success());
+        assert!(result.is_error);
+        assert_eq!(result.effective_error_message().as_deref(), Some("boom"));
+        assert_eq!(result.llm_payload(), json!({"error": "boom"}));
+    }
+
+    #[tokio::test]
     async fn test_tool_result_serialization() {
         let result = ToolResult {
             success: true,
             output: Some(json!({"key": "value"})),
             error: None,
+            ..ToolResult::default()
         };
 
         let serialized = serde_json::to_string(&result).unwrap();

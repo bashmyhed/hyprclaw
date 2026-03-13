@@ -35,6 +35,7 @@ impl Tool for EchoTool {
             success: true,
             output: Some(input),
             error: None,
+            ..ToolResult::default()
         })
     }
 }
