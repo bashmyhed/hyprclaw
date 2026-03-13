@@ -117,7 +117,11 @@ impl ExecutionStage {
     }
 
     pub async fn run(&self, ctx: &ToolDispatchContext) -> Result<ToolResult, ToolError> {
-        match ctx.permission_decision.as_ref().ok_or(ToolError::Internal)? {
+        match ctx
+            .permission_decision
+            .as_ref()
+            .ok_or(ToolError::Internal)?
+        {
             PermissionDecision::Deny(reason) => Err(ToolError::PermissionDenied(reason.clone())),
             PermissionDecision::RequireApproval(msg) => Ok(ToolResult::approval_required(msg)),
             PermissionDecision::Allow => {
@@ -173,7 +177,10 @@ impl RecoveryClassificationStage {
         let mut result = result;
 
         if result.error_kind.is_none() {
-            result.error_kind = result.error.as_ref().map(|_| "execution_failed".to_string());
+            result.error_kind = result
+                .error
+                .as_ref()
+                .map(|_| "execution_failed".to_string());
         }
 
         if result.recovery_hint.is_none() && !result.is_effective_success() {
@@ -193,11 +200,7 @@ impl<'a> AuditStage<'a> {
         Self { audit }
     }
 
-    pub async fn run(
-        &self,
-        ctx: &ToolDispatchContext,
-        result: &Result<ToolResult, ToolError>,
-    ) {
+    pub async fn run(&self, ctx: &ToolDispatchContext, result: &Result<ToolResult, ToolError>) {
         let permission_tier = ctx.permission_tier;
         let decision = ctx.permission_decision.as_ref();
         let log_entry = json!({
@@ -280,7 +283,10 @@ mod tests {
         VisibilityStage::new(&registry).run(&mut ctx).unwrap();
         InputValidationStage.run(&ctx).unwrap();
         SafetyPolicyStage.run(&ctx).unwrap();
-        PermissionStage::new(&permission).run(&mut ctx).await.unwrap();
+        PermissionStage::new(&permission)
+            .run(&mut ctx)
+            .await
+            .unwrap();
         let result = ExecutionStage::new(1000).run(&ctx).await.unwrap();
         let result = ResultNormalizationStage.run(result);
 

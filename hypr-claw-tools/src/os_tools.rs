@@ -7,7 +7,10 @@ use crate::runtime_health;
 use crate::tools::base::{Tool, ToolResult};
 use crate::traits::PermissionTier;
 use async_trait::async_trait;
+use reqwest::{Client, Method};
 use serde_json::{json, Value};
+use std::env;
+use std::time::Duration;
 
 fn required_str<'a>(input: &'a Value, field: &str) -> Result<&'a str, ToolError> {
     input[field]
@@ -22,6 +25,101 @@ fn required_u32(input: &Value, field: &str) -> Result<u32, ToolError> {
     u32::try_from(n).map_err(|_| ToolError::ValidationError(format!("'{field}' out of range")))
 }
 
+fn optional_str<'a>(input: &'a Value, field: &str) -> Option<&'a str> {
+    input.get(field).and_then(|value| value.as_str())
+}
+
+fn pinchtab_base_url() -> String {
+    env::var("PINCHTAB_URL").unwrap_or_else(|_| "http://127.0.0.1:9867".to_string())
+}
+
+fn pinchtab_token() -> Option<String> {
+    env::var("PINCHTAB_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn pinchtab_timeout_secs(input: &Value, default_secs: u64) -> u64 {
+    input
+        .get("timeout_secs")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(default_secs)
+        .clamp(1, 120)
+}
+
+fn pinchtab_path(input: &Value, suffix: &str) -> String {
+    match optional_str(input, "instance_id") {
+        Some(instance_id) if !instance_id.trim().is_empty() => {
+            format!("/instances/{}/{}", instance_id.trim(), suffix)
+        }
+        _ => format!("/{}", suffix),
+    }
+}
+
+async fn pinchtab_request(
+    method: Method,
+    path: String,
+    input: &Value,
+    query: Option<Vec<(&str, String)>>,
+    body: Option<Value>,
+    default_timeout_secs: u64,
+) -> Result<Value, ToolError> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(pinchtab_timeout_secs(
+            input,
+            default_timeout_secs,
+        )))
+        .build()
+        .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+
+    let url = format!("{}{}", pinchtab_base_url().trim_end_matches('/'), path);
+    let mut request = client.request(method, url);
+
+    request = request.header("Accept", "application/json");
+    if let Some(token) = pinchtab_token() {
+        request = request.bearer_auth(token);
+    }
+    if let Some(query_pairs) = query {
+        request = request.query(&query_pairs);
+    }
+    if let Some(body_value) = body {
+        request = request.json(&body_value);
+    }
+
+    let response = request
+        .send()
+        .await
+        .map_err(|error| ToolError::ExecutionFailed(format!("pinchtab request failed: {error}")))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|error| ToolError::ExecutionFailed(format!("pinchtab read failed: {error}")))?;
+
+    let payload = if text.trim().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str::<Value>(&text).unwrap_or_else(|_| json!({ "raw": text }))
+    };
+
+    if status.is_success() {
+        Ok(payload)
+    } else {
+        let detail = payload
+            .get("error")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| payload.to_string());
+        Err(ToolError::ExecutionFailed(format!(
+            "pinchtab {} returned {}: {}",
+            path,
+            status.as_u16(),
+            detail
+        )))
+    }
+}
+
 pub struct FsCreateDirTool;
 pub struct FsDeleteTool;
 pub struct FsMoveTool;
@@ -29,6 +127,132 @@ pub struct FsCopyTool;
 pub struct FsReadTool;
 pub struct FsWriteTool;
 pub struct FsListTool;
+pub struct BrowserHealthTool;
+pub struct BrowserNavigateTool;
+pub struct BrowserSnapshotTool;
+pub struct BrowserActionTool;
+pub struct BrowserEvaluateTool;
+pub struct BrowserScreenshotTool;
+pub struct DesktopOpenWorkspaceAppTool;
+
+enum WorkspaceTarget {
+    Url(String),
+    Native {
+        app: String,
+        args: Vec<String>,
+    },
+    Search {
+        query: String,
+        engine: Option<String>,
+    },
+}
+
+fn simple_query_encode(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    out
+}
+
+fn resolve_workspace_target(
+    app: &str,
+    query: Option<&str>,
+    prefer_native: bool,
+) -> WorkspaceTarget {
+    let normalized = app.trim().to_ascii_lowercase();
+    let encoded_query = query.map(simple_query_encode);
+
+    match normalized.as_str() {
+        "gmail" | "mail" | "inbox" => {
+            WorkspaceTarget::Url("https://mail.google.com/mail/u/0/#inbox".to_string())
+        }
+        "calendar" | "google calendar" => {
+            WorkspaceTarget::Url("https://calendar.google.com/calendar/u/0/r".to_string())
+        }
+        "drive" | "google drive" => {
+            WorkspaceTarget::Url("https://drive.google.com/drive/my-drive".to_string())
+        }
+        "docs" | "google docs" => {
+            WorkspaceTarget::Url("https://docs.google.com/document/u/0/".to_string())
+        }
+        "sheets" | "google sheets" => {
+            WorkspaceTarget::Url("https://docs.google.com/spreadsheets/u/0/".to_string())
+        }
+        "slides" | "google slides" => {
+            WorkspaceTarget::Url("https://docs.google.com/presentation/u/0/".to_string())
+        }
+        "whatsapp" | "whatsapp web" => {
+            if let Some(encoded) = encoded_query {
+                WorkspaceTarget::Url(format!("https://web.whatsapp.com/?text={encoded}"))
+            } else {
+                WorkspaceTarget::Url("https://web.whatsapp.com/".to_string())
+            }
+        }
+        "telegram" => {
+            if prefer_native {
+                WorkspaceTarget::Native {
+                    app: "telegram-desktop".to_string(),
+                    args: Vec::new(),
+                }
+            } else {
+                WorkspaceTarget::Url("https://web.telegram.org/k/".to_string())
+            }
+        }
+        "codex" | "chatgpt" | "openai" => WorkspaceTarget::Url("https://chatgpt.com/".to_string()),
+        "youtube" | "yt" => {
+            if let Some(encoded) = encoded_query {
+                WorkspaceTarget::Url(format!(
+                    "https://www.youtube.com/results?search_query={encoded}"
+                ))
+            } else {
+                WorkspaceTarget::Url("https://www.youtube.com/".to_string())
+            }
+        }
+        "github" => {
+            if let Some(encoded) = encoded_query {
+                WorkspaceTarget::Url(format!("https://github.com/search?q={encoded}"))
+            } else {
+                WorkspaceTarget::Url("https://github.com/".to_string())
+            }
+        }
+        "spotify" => {
+            if let Some(encoded) = encoded_query {
+                WorkspaceTarget::Url(format!("https://open.spotify.com/search/{encoded}"))
+            } else {
+                WorkspaceTarget::Url("https://open.spotify.com/".to_string())
+            }
+        }
+        "firefox" | "browser" => WorkspaceTarget::Native {
+            app: "firefox".to_string(),
+            args: Vec::new(),
+        },
+        "files" | "file manager" | "nautilus" => WorkspaceTarget::Native {
+            app: "nautilus".to_string(),
+            args: Vec::new(),
+        },
+        "terminal" => WorkspaceTarget::Native {
+            app: "kitty".to_string(),
+            args: Vec::new(),
+        },
+        "code" | "vscode" | "editor" => WorkspaceTarget::Native {
+            app: "code".to_string(),
+            args: Vec::new(),
+        },
+        _ => WorkspaceTarget::Search {
+            query: query
+                .map(|value| format!("{app} {value}"))
+                .unwrap_or_else(|| app.to_string()),
+            engine: None,
+        },
+    }
+}
 
 #[async_trait]
 impl Tool for FsCreateDirTool {
@@ -630,6 +854,68 @@ impl Tool for DesktopOpenGmailTool {
 }
 
 #[async_trait]
+impl Tool for DesktopOpenWorkspaceAppTool {
+    fn name(&self) -> &'static str {
+        "desktop.open_workspace_app"
+    }
+    fn description(&self) -> &'static str {
+        "Open a common workspace app or web target such as gmail, youtube, telegram, whatsapp, codex, github, calendar, or drive"
+    }
+    fn permission_tier(&self) -> PermissionTier {
+        PermissionTier::Execute
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "app": {"type": "string"},
+                "query": {"type": "string"},
+                "prefer_native": {"type": "boolean"}
+            },
+            "required": ["app"],
+            "additionalProperties": false
+        })
+    }
+    async fn execute(&self, _ctx: ExecutionContext, input: Value) -> Result<ToolResult, ToolError> {
+        let app = required_str(&input, "app")?;
+        let query = optional_str(&input, "query");
+        let prefer_native = input
+            .get("prefer_native")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+
+        let target = resolve_workspace_target(app, query, prefer_native);
+        let output = match target {
+            WorkspaceTarget::Url(url) => {
+                desktop::open_url(&url)
+                    .await
+                    .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+                json!({"app": app, "opened_url": url, "query": query, "mode": "url"})
+            }
+            WorkspaceTarget::Native { app, args } => {
+                let pid = desktop::launch_app(&app, &args)
+                    .await
+                    .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+                json!({"app": app, "pid": pid, "args": args, "mode": "native"})
+            }
+            WorkspaceTarget::Search { query, engine } => {
+                let url = desktop::search_web(&query, engine.as_deref())
+                    .await
+                    .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+                json!({"app": app, "query": query, "url": url, "mode": "search"})
+            }
+        };
+
+        Ok(ToolResult {
+            success: true,
+            output: Some(output),
+            error: None,
+            ..ToolResult::default()
+        })
+    }
+}
+
+#[async_trait]
 impl Tool for DesktopTypeTextTool {
     fn name(&self) -> &'static str {
         "desktop.type_text"
@@ -871,6 +1157,339 @@ impl Tool for DesktopHealthStatusTool {
         let output = serde_json::to_value(snapshot).map_err(|error| {
             ToolError::ExecutionFailed(format!("failed to serialize runtime health: {error}"))
         })?;
+        Ok(ToolResult {
+            success: true,
+            output: Some(output),
+            error: None,
+            ..ToolResult::default()
+        })
+    }
+}
+
+#[async_trait]
+impl Tool for BrowserHealthTool {
+    fn name(&self) -> &'static str {
+        "browser.health"
+    }
+    fn description(&self) -> &'static str {
+        "Check whether the Pinchtab browser bridge is reachable"
+    }
+    fn permission_tier(&self) -> PermissionTier {
+        PermissionTier::Read
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "instance_id": {"type": "string"},
+                "timeout_secs": {"type": "number"}
+            },
+            "additionalProperties": false
+        })
+    }
+    async fn execute(&self, _ctx: ExecutionContext, input: Value) -> Result<ToolResult, ToolError> {
+        let output = pinchtab_request(
+            Method::GET,
+            pinchtab_path(&input, "health"),
+            &input,
+            None,
+            None,
+            10,
+        )
+        .await?;
+        Ok(ToolResult {
+            success: true,
+            output: Some(json!({
+                "base_url": pinchtab_base_url(),
+                "health": output
+            })),
+            error: None,
+            ..ToolResult::default()
+        })
+    }
+}
+
+#[async_trait]
+impl Tool for BrowserNavigateTool {
+    fn name(&self) -> &'static str {
+        "browser.navigate"
+    }
+    fn description(&self) -> &'static str {
+        "Navigate the active Pinchtab browser instance to a URL"
+    }
+    fn permission_tier(&self) -> PermissionTier {
+        PermissionTier::Execute
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "url": {"type": "string"},
+                "instance_id": {"type": "string"},
+                "new_tab": {"type": "boolean"},
+                "block_images": {"type": "boolean"},
+                "timeout_secs": {"type": "number"}
+            },
+            "required": ["url"],
+            "additionalProperties": false
+        })
+    }
+    async fn execute(&self, _ctx: ExecutionContext, input: Value) -> Result<ToolResult, ToolError> {
+        let url = required_str(&input, "url")?;
+        let mut body = serde_json::Map::new();
+        body.insert("url".to_string(), Value::String(url.to_string()));
+        body.insert(
+            "timeout".to_string(),
+            Value::from(pinchtab_timeout_secs(&input, 30)),
+        );
+        if let Some(new_tab) = input.get("new_tab").and_then(|value| value.as_bool()) {
+            body.insert("newTab".to_string(), Value::Bool(new_tab));
+        }
+        if let Some(block_images) = input.get("block_images").and_then(|value| value.as_bool()) {
+            body.insert("blockImages".to_string(), Value::Bool(block_images));
+        }
+        let output = pinchtab_request(
+            Method::POST,
+            pinchtab_path(&input, "navigate"),
+            &input,
+            None,
+            Some(Value::Object(body)),
+            30,
+        )
+        .await?;
+        Ok(ToolResult {
+            success: true,
+            output: Some(output),
+            error: None,
+            ..ToolResult::default()
+        })
+    }
+}
+
+#[async_trait]
+impl Tool for BrowserSnapshotTool {
+    fn name(&self) -> &'static str {
+        "browser.snapshot"
+    }
+    fn description(&self) -> &'static str {
+        "Get a structured accessibility snapshot from the active Pinchtab browser tab"
+    }
+    fn permission_tier(&self) -> PermissionTier {
+        PermissionTier::Read
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "instance_id": {"type": "string"},
+                "tab_id": {"type": "string"},
+                "filter": {"type": "string"},
+                "format": {"type": "string"},
+                "selector": {"type": "string"},
+                "max_tokens": {"type": "number"},
+                "depth": {"type": "number"},
+                "diff": {"type": "boolean"},
+                "no_animations": {"type": "boolean"},
+                "timeout_secs": {"type": "number"}
+            },
+            "additionalProperties": false
+        })
+    }
+    async fn execute(&self, _ctx: ExecutionContext, input: Value) -> Result<ToolResult, ToolError> {
+        let mut query = Vec::new();
+        for (field, query_name) in [
+            ("tab_id", "tabId"),
+            ("filter", "filter"),
+            ("format", "format"),
+            ("selector", "selector"),
+        ] {
+            if let Some(value) = optional_str(&input, field) {
+                query.push((query_name, value.to_string()));
+            }
+        }
+        for (field, query_name) in [("max_tokens", "maxTokens"), ("depth", "depth")] {
+            if let Some(value) = input.get(field).and_then(|value| value.as_u64()) {
+                query.push((query_name, value.to_string()));
+            }
+        }
+        if input.get("diff").and_then(|value| value.as_bool()) == Some(true) {
+            query.push(("diff", "true".to_string()));
+        }
+        if input.get("no_animations").and_then(|value| value.as_bool()) == Some(true) {
+            query.push(("noAnimations", "true".to_string()));
+        }
+        let output = pinchtab_request(
+            Method::GET,
+            pinchtab_path(&input, "snapshot"),
+            &input,
+            Some(query),
+            None,
+            30,
+        )
+        .await?;
+        Ok(ToolResult {
+            success: true,
+            output: Some(output),
+            error: None,
+            ..ToolResult::default()
+        })
+    }
+}
+
+#[async_trait]
+impl Tool for BrowserActionTool {
+    fn name(&self) -> &'static str {
+        "browser.action"
+    }
+    fn description(&self) -> &'static str {
+        "Perform a browser action such as click, type, press, focus, fill, hover, select, or scroll via Pinchtab"
+    }
+    fn permission_tier(&self) -> PermissionTier {
+        PermissionTier::Execute
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string"},
+                "instance_id": {"type": "string"},
+                "tab_id": {"type": "string"},
+                "owner": {"type": "string"},
+                "ref": {"type": "string"},
+                "selector": {"type": "string"},
+                "text": {"type": "string"},
+                "value": {"type": "string"},
+                "key": {"type": "string"},
+                "node_id": {"type": "number"},
+                "timeout_secs": {"type": "number"}
+            },
+            "required": ["kind"],
+            "additionalProperties": false
+        })
+    }
+    async fn execute(&self, _ctx: ExecutionContext, input: Value) -> Result<ToolResult, ToolError> {
+        let kind = required_str(&input, "kind")?;
+        let mut body = json!({
+            "kind": kind,
+        });
+        let body_obj = body.as_object_mut().expect("json object");
+        for (field, target) in [
+            ("tab_id", "tabId"),
+            ("owner", "owner"),
+            ("ref", "ref"),
+            ("selector", "selector"),
+            ("text", "text"),
+            ("value", "value"),
+            ("key", "key"),
+        ] {
+            if let Some(value) = optional_str(&input, field) {
+                body_obj.insert(target.to_string(), Value::String(value.to_string()));
+            }
+        }
+        if let Some(node_id) = input.get("node_id").and_then(|value| value.as_i64()) {
+            body_obj.insert("nodeId".to_string(), Value::from(node_id));
+        }
+        let output = pinchtab_request(
+            Method::POST,
+            pinchtab_path(&input, "action"),
+            &input,
+            None,
+            Some(body),
+            30,
+        )
+        .await?;
+        Ok(ToolResult {
+            success: true,
+            output: Some(output),
+            error: None,
+            ..ToolResult::default()
+        })
+    }
+}
+
+#[async_trait]
+impl Tool for BrowserEvaluateTool {
+    fn name(&self) -> &'static str {
+        "browser.evaluate"
+    }
+    fn description(&self) -> &'static str {
+        "Run JavaScript in the active Pinchtab browser tab and return the result"
+    }
+    fn permission_tier(&self) -> PermissionTier {
+        PermissionTier::Read
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "expression": {"type": "string"},
+                "instance_id": {"type": "string"},
+                "timeout_secs": {"type": "number"}
+            },
+            "required": ["expression"],
+            "additionalProperties": false
+        })
+    }
+    async fn execute(&self, _ctx: ExecutionContext, input: Value) -> Result<ToolResult, ToolError> {
+        let expression = required_str(&input, "expression")?;
+        let output = pinchtab_request(
+            Method::POST,
+            pinchtab_path(&input, "evaluate"),
+            &input,
+            None,
+            Some(json!({ "expression": expression })),
+            30,
+        )
+        .await?;
+        Ok(ToolResult {
+            success: true,
+            output: Some(output),
+            error: None,
+            ..ToolResult::default()
+        })
+    }
+}
+
+#[async_trait]
+impl Tool for BrowserScreenshotTool {
+    fn name(&self) -> &'static str {
+        "browser.screenshot"
+    }
+    fn description(&self) -> &'static str {
+        "Capture a screenshot from the active Pinchtab browser tab"
+    }
+    fn permission_tier(&self) -> PermissionTier {
+        PermissionTier::Read
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "instance_id": {"type": "string"},
+                "tab_id": {"type": "string"},
+                "full_page": {"type": "boolean"},
+                "timeout_secs": {"type": "number"}
+            },
+            "additionalProperties": false
+        })
+    }
+    async fn execute(&self, _ctx: ExecutionContext, input: Value) -> Result<ToolResult, ToolError> {
+        let mut query = Vec::new();
+        if let Some(tab_id) = optional_str(&input, "tab_id") {
+            query.push(("tabId", tab_id.to_string()));
+        }
+        if input.get("full_page").and_then(|value| value.as_bool()) == Some(true) {
+            query.push(("fullPage", "true".to_string()));
+        }
+        let output = pinchtab_request(
+            Method::GET,
+            pinchtab_path(&input, "screenshot"),
+            &input,
+            Some(query),
+            None,
+            30,
+        )
+        .await?;
         Ok(ToolResult {
             success: true,
             output: Some(output),
@@ -1265,7 +1884,11 @@ impl Tool for DesktopClickTool {
         let button = input["button"].as_str().unwrap_or("left");
         let tolerance = input["tolerance"].as_i64().unwrap_or(8) as i32;
         let timeout_ms = input["timeout_ms"].as_u64().unwrap_or(900);
-        let result = if input.get("query").and_then(|value| value.as_str()).is_some() {
+        let result = if input
+            .get("query")
+            .and_then(|value| value.as_str())
+            .is_some()
+        {
             let query = required_str(&input, "query")?;
             let occurrence = input["occurrence"].as_u64().unwrap_or(0) as usize;
             let case_sensitive = input["case_sensitive"].as_bool().unwrap_or(false);

@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 pub mod bootstrap;
 pub mod config;
 pub mod debug_notify;
+pub mod debug_timeline;
 pub mod scan;
 
 use config::{Config, LLMProvider};
@@ -26,6 +27,14 @@ enum CliMode {
     Health,
     Help,
     Invalid(String),
+}
+
+#[derive(Debug, Clone)]
+struct LastRunSummary {
+    prompt: String,
+    status: String,
+    detail: String,
+    elapsed_ms: u64,
 }
 
 const MAX_RECOVERY_ATTEMPTS: u32 = 2;
@@ -377,27 +386,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         compactor,
         active_soul.max_iterations,
     );
+    let mut observers: Vec<Arc<dyn hypr_claw_runtime::DebugObserver>> = vec![Arc::new(
+        hypr_claw_app::debug_timeline::TimelineDebugObserver::new(
+            action_feed.clone(),
+            true,
+            debug_mode,
+        ),
+    )];
     if debug_notify {
-        agent_loop.set_debug_observer(Arc::new(
+        observers.push(Arc::new(
             hypr_claw_app::debug_notify::DesktopNotificationObserver::new(true),
         ));
     }
+    agent_loop.set_debug_observer(Arc::new(
+        hypr_claw_app::debug_timeline::CompositeDebugObserver::new(observers),
+    ));
 
     // Run REPL loop
     let system_prompt = active_soul.system_prompt.clone();
 
-    print_console_bootstrap(
-        provider_name,
-        &config.model,
-        &agent_name,
-        &display_name(&agent_state, &user_id),
-        &user_id,
-        &session_key,
-        &agent_state.active_thread_id,
-        &runtime_health,
-        &active_allowed_tools,
-        cli_mode_label(&cli_mode),
-    );
+    if matches!(cli_mode, CliMode::Interactive) {
+        render_operator_home(
+            &config.model,
+            provider_name,
+            &runtime_health,
+            &active_allowed_tools,
+            &agent_state.active_thread_id,
+            &display_name(&agent_state, &user_id),
+            &agent_state.onboarding.owner_profile,
+            &action_feed,
+            None,
+        );
+    } else {
+        print_console_bootstrap(
+            provider_name,
+            &config.model,
+            &agent_name,
+            &display_name(&agent_state, &user_id),
+            &user_id,
+            &session_key,
+            &agent_state.active_thread_id,
+            &runtime_health,
+            &active_allowed_tools,
+            cli_mode_label(&cli_mode),
+        );
+    }
 
     // Setup interrupt signal (Ctrl+C interrupts current request, does not exit process)
     let interrupt = Arc::new(tokio::sync::Notify::new());
@@ -416,6 +449,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut cli_run_error: Option<String> = None;
     let mut queue_block_notice: Option<String> = None;
     let mut transcript_view_mode = true;
+    let mut last_run_summary: Option<LastRunSummary> = None;
     let mut background_task_index: HashMap<String, TaskStateDigest> = HashMap::new();
     let mut supervisor_background_map: HashMap<String, String> = HashMap::new();
     for task in &agent_state.supervisor.tasks {
@@ -555,6 +589,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let system_prompt_bg = augment_system_prompt_for_turn(
                                 &system_prompt,
                                 &agent_state.onboarding.system_profile,
+                                &agent_state.onboarding.owner_profile,
                                 &capability_registry,
                                 &runtime_health,
                                 &active_allowed_tools,
@@ -726,12 +761,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .iter()
                     .filter(|t| t.status == hypr_claw_tasks::TaskStatus::Running)
                     .count();
-                let prompt = format!(
-                    "hc[{}|{}|{}]> ",
-                    truncate_for_table(&agent_state.active_thread_id, 12),
-                    short_model_name(&config.model),
-                    running_tasks
+                render_operator_home(
+                    &config.model,
+                    provider_name,
+                    &runtime_health,
+                    &active_allowed_tools,
+                    &agent_state.active_thread_id,
+                    &display_name(&agent_state, &user_id),
+                    &agent_state.onboarding.owner_profile,
+                    &action_feed,
+                    last_run_summary.as_ref(),
                 );
+                let prompt = if running_tasks > 0 {
+                    format!("›({running_tasks}) ")
+                } else {
+                    "› ".to_string()
+                };
                 print!("{}", ui_accent(&prompt));
                 io::stdout().flush().ok();
 
@@ -835,6 +880,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 serde_json::to_string_pretty(profile).unwrap_or_else(|_| "{}".to_string())
                             );
                         }
+                        print_owner_profile_summary(&agent_state.onboarding.owner_profile);
+                        continue;
+                    }
+                    "owner" | "/owner" => {
+                        print_owner_profile_summary(&agent_state.onboarding.owner_profile);
+                        continue;
+                    }
+                    "owner edit" | "/owner edit" => {
+                        let updated = capture_owner_profile(&agent_state.onboarding.owner_profile)?;
+                        agent_state.onboarding.owner_profile = updated;
+                        print_owner_profile_summary(&agent_state.onboarding.owner_profile);
+                        agent_state.onboarding.owner_profile_confirmed =
+                            prompt_yes_no("Save this owner profile? [Y/n] ", true)?;
+                        sync_owner_profile_facts(&mut context, &agent_state.onboarding.owner_profile);
+                        persist_agent_os_state(&mut context, &agent_state);
+                        context_manager.save(&context).await?;
                         continue;
                     }
                     "capabilities history" | "/capabilities history" => {
@@ -1489,6 +1550,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let system_prompt_bg = augment_system_prompt_for_turn(
                                     &system_prompt,
                                     &agent_state.onboarding.system_profile,
+                                    &agent_state.onboarding.owner_profile,
                                     &capability_registry,
                                     &runtime_health,
                                     &active_allowed_tools,
@@ -1892,6 +1954,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let turn_system_prompt = augment_system_prompt_for_turn(
                     &system_prompt,
                     &agent_state.onboarding.system_profile,
+                    &agent_state.onboarding.owner_profile,
                     &capability_registry,
                     &runtime_health,
                     &active_allowed_tools,
@@ -2236,6 +2299,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             );
                         }
                         print_result_panel(&response, run_elapsed_ms, debug_mode);
+                        last_run_summary = Some(LastRunSummary {
+                            prompt: sanitize_single_line(&effective_input),
+                            status: "done".to_string(),
+                            detail: truncate_for_table(&sanitize_single_line(&response), 104),
+                            elapsed_ms: run_elapsed_ms,
+                        });
                     }
                     Err(e) => {
                         let error_msg = e.to_string();
@@ -2308,6 +2377,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         if error_msg.contains("Interrupted by user") {
                             println!("⏹ Request interrupted by user.\n");
+                            last_run_summary = Some(LastRunSummary {
+                                prompt: sanitize_single_line(&effective_input),
+                                status: "interrupted".to_string(),
+                                detail: "request interrupted by user".to_string(),
+                                elapsed_ms: run_elapsed_ms,
+                            });
                         } else if stop_code == "STOP_WATCHDOG_TIMEOUT" {
                             print_stalled_panel(
                                 watchdog_timeout.as_secs(),
@@ -2315,12 +2390,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 debug_mode,
                                 &error_msg,
                             );
+                            last_run_summary = Some(LastRunSummary {
+                                prompt: sanitize_single_line(&effective_input),
+                                status: stop_code.to_string(),
+                                detail: truncate_for_table(&sanitize_single_line(&error_msg), 104),
+                                elapsed_ms: run_elapsed_ms,
+                            });
                         } else {
-                            eprintln!("❌ Error [{}]: {}", stop_code, e);
-                            if !hint.is_empty() {
-                                eprintln!("💡 Next step: {}", hint);
-                            }
-                            eprintln!();
+                            print_failure_panel(stop_code, &hint, &error_msg);
+                            last_run_summary = Some(LastRunSummary {
+                                prompt: sanitize_single_line(&effective_input),
+                                status: stop_code.to_string(),
+                                detail: truncate_for_table(&sanitize_single_line(&error_msg), 104),
+                                elapsed_ms: run_elapsed_ms,
+                            });
                         }
                     }
                 }
@@ -2387,14 +2470,14 @@ fn initialize_directories() -> Result<(), Box<dyn std::error::Error>> {
     if !std::path::Path::new(default_agent_config).exists() {
         std::fs::write(
             default_agent_config,
-            "id: default\nsoul: default_soul.md\ntools:\n  - echo\n  - fs.read\n  - fs.write\n  - fs.list\n  - fs.create_dir\n  - fs.move\n  - fs.copy\n  - fs.delete\n  - hypr.workspace.switch\n  - hypr_workspace_enter_agent\n  - hypr_workspace_return_user\n  - hypr.workspace.move_window\n  - hypr.window.focus\n  - hypr.window.close\n  - hypr.window.move\n  - hypr.exec\n  - proc.spawn\n  - proc.kill\n  - proc.list\n  - desktop.open_url\n  - desktop.launch_app\n  - desktop.launch_app_and_wait_text\n  - desktop.search_web\n  - desktop.open_gmail\n  - desktop.type_text\n  - desktop.key_press\n  - desktop.key_combo\n  - desktop.mouse_click\n  - desktop.capture_screen\n  - desktop.health_status\n  - desktop.fast_window_state\n  - desktop.active_window\n  - desktop.list_windows\n  - desktop.cursor_position\n  - desktop.read_screen_state\n  - desktop.mouse_move\n  - desktop.mouse_move_and_verify\n  - desktop.click_at\n  - desktop.click_at_and_verify\n  - desktop.ocr_screen\n  - desktop.find_text\n  - desktop.click_text\n  - desktop.wait_for_text\n  - wallpaper.set\n  - system.memory\n  - system.battery\n"
+            "id: default\nsoul: default_soul.md\ntools:\n  - echo\n  - fs.read\n  - fs.write\n  - fs.list\n  - fs.create_dir\n  - fs.move\n  - fs.copy\n  - fs.delete\n  - hypr.workspace.switch\n  - hypr_workspace_enter_agent\n  - hypr_workspace_return_user\n  - hypr.workspace.move_window\n  - hypr.window.focus\n  - hypr.window.close\n  - hypr.window.move\n  - hypr.exec\n  - proc.spawn\n  - proc.kill\n  - proc.list\n  - browser.health\n  - browser.navigate\n  - browser.snapshot\n  - browser.action\n  - browser.evaluate\n  - browser.screenshot\n  - desktop.open_url\n  - desktop.open_workspace_app\n  - desktop.launch_app\n  - desktop.launch_app_and_wait_text\n  - desktop.search_web\n  - desktop.open_gmail\n  - desktop.type_text\n  - desktop.key_press\n  - desktop.key_combo\n  - desktop.mouse_click\n  - desktop.capture_screen\n  - desktop.health_status\n  - desktop.fast_window_state\n  - desktop.active_window\n  - desktop.list_windows\n  - desktop.cursor_position\n  - desktop.read_screen_state\n  - desktop.mouse_move\n  - desktop.mouse_move_and_verify\n  - desktop.click_at\n  - desktop.click_at_and_verify\n  - desktop.ocr_screen\n  - desktop.find_text\n  - desktop.click_text\n  - desktop.wait_for_text\n  - wallpaper.set\n  - system.memory\n  - system.battery\n"
         )?;
     }
 
     if !std::path::Path::new(default_agent_soul).exists() {
         std::fs::write(
             default_agent_soul,
-            "You are a local Linux + Hyprland OS assistant. Treat the whole computer as controllable from prompts: apps, browser, files, windows, typing, clicks, and system state. Follow strict workflow: observe -> plan -> execute tool -> verify -> continue until done. If backend reliability is unclear, use desktop.health_status first. Choose tools dynamically from allowed set. Ask permission before destructive/high-impact actions. Use mouse+keyboard style actions for GUI tasks.",
+            "You are a local Linux + Hyprland OS assistant. Treat the whole computer as controllable from prompts: apps, browser tabs, files, windows, typing, clicks, and system state. Follow strict workflow: observe -> plan -> execute tool -> verify -> continue until done. For browser work, prefer browser.health/browser.navigate/browser.snapshot/browser.action before pixel-only automation. If backend reliability is unclear, use desktop.health_status first. Choose tools dynamically from allowed set. Ask permission before destructive/high-impact actions. Use mouse+keyboard style actions for GUI tasks.",
         )?;
     }
 
@@ -2408,7 +2491,7 @@ struct SoulProfile {
 
 fn power_agent_profile() -> SoulProfile {
     SoulProfile {
-        system_prompt: "You are a powerful local Linux + Hyprland OS assistant.\nYour job is to operate the whole computer from prompts: launch apps, drive browser workflows, read the desktop, type, click, manage files, and complete tasks end-to-end.\nFollow strict workflow: observe -> plan -> execute tool -> verify -> continue until done.\nFor GUI tasks, use desktop.health_status when backend reliability is unclear, then observe with desktop.fast_window_state, then desktop.active_window, then desktop.list_windows, then desktop.read_screen_state with include_ocr=false; use OCR tools only when text detection is actually required.\nChoose tools dynamically from allowed_tools_now.\nAsk for permission before destructive/high-impact actions.\nAvoid hardcoded assumptions and adapt from live system/context.".to_string(),
+        system_prompt: "You are a powerful local Linux + Hyprland OS assistant.\nYour job is to operate the whole computer from prompts: launch apps, drive browser workflows, read the desktop, type, click, manage files, and complete tasks end-to-end.\nFollow strict workflow: observe -> plan -> execute tool -> verify -> continue until done.\nFor browser tasks, prefer browser.health, browser.navigate, browser.snapshot, and browser.action before pixel-only desktop automation.\nFor GUI tasks, use desktop.health_status when backend reliability is unclear, then observe with desktop.fast_window_state, then desktop.active_window, then desktop.list_windows, then desktop.read_screen_state with include_ocr=false; use OCR tools only when text detection is actually required.\nChoose tools dynamically from allowed_tools_now.\nAsk for permission before destructive/high-impact actions.\nAvoid hardcoded assumptions and adapt from live system/context.".to_string(),
         max_iterations: 36,
     }
 }
@@ -2420,8 +2503,14 @@ fn normalize_runtime_tool_name(name: &str) -> String {
         "screen.find_text" | "text.find_on_screen" => "desktop.find_text".to_string(),
         "screen.click_text" | "text.click_on_screen" => "desktop.click_text".to_string(),
         "gmail.open" => "desktop.open_gmail".to_string(),
+        "app.open_common" | "desktop.open_app" | "workspace.open_app" => {
+            "desktop.open_workspace_app".to_string()
+        }
         "browser.open_url" => "desktop.open_url".to_string(),
         "browser.search" => "desktop.search_web".to_string(),
+        "browser.open" | "web.open" | "web.navigate" => "browser.navigate".to_string(),
+        "browser.read" | "web.snapshot" => "browser.snapshot".to_string(),
+        "browser.click" | "browser.type" | "web.action" => "browser.action".to_string(),
         "app.open" | "app.launch" => "desktop.launch_app".to_string(),
         "process.spawn" => "proc.spawn".to_string(),
         "process.kill" => "proc.kill".to_string(),
@@ -2870,6 +2959,7 @@ fn overall_health_badge(snapshot: &hypr_claw_tools::RuntimeHealthSnapshot) -> St
 
 fn tool_family_summary(allowed_tools: &HashSet<String>) -> String {
     let groups = [
+        ("browser", "browser."),
         ("desktop", "desktop."),
         ("hypr", "hypr."),
         ("workspace", "hypr_workspace_"),
@@ -3073,154 +3163,227 @@ fn print_console_bootstrap(
     agent_name: &str,
     display_name: &str,
     user_id: &str,
-    session_key: &str,
+    _session_key: &str,
     active_thread_id: &str,
     runtime_health: &hypr_claw_tools::RuntimeHealthSnapshot,
     allowed_tools: &HashSet<String>,
     mode_label: &str,
 ) {
-    println!("{}", ui_section("Hypr-Claw"));
+    println!();
     println!(
         "{} {}  {} {}  {} {}",
-        ui_dim("provider"),
-        ui_info(&truncate_for_table(provider_name, 20)),
-        ui_dim("model"),
+        ui_title("Hypr-Claw"),
         ui_info(&truncate_for_table(&short_model_name(model), 24)),
-        ui_dim("session"),
-        truncate_for_table(session_key, 26)
-    );
-    println!(
-        "{} {}  {} {}  {} {}",
-        ui_dim("user"),
-        truncate_for_table(&format!("{} ({})", display_name, user_id), 24),
-        ui_dim("agent"),
-        truncate_for_table(agent_name, 16),
-        ui_dim("thread"),
-        truncate_for_table(active_thread_id, 14)
-    );
-    println!(
-        "{} {}  {} {}  {} {}",
         ui_dim("mode"),
         ui_info(mode_label),
         ui_dim("health"),
-        overall_health_badge(runtime_health),
+        overall_health_badge(runtime_health)
+    );
+    let browser_ready = allowed_tools
+        .iter()
+        .any(|tool| tool.starts_with("browser."));
+    println!(
+        "{} {}  {} {}  {} {}",
         ui_dim("tools"),
-        ui_info(&allowed_tools.len().to_string())
+        ui_info(&allowed_tools.len().to_string()),
+        ui_dim("browser"),
+        if browser_ready {
+            ui_success("ready")
+        } else {
+            ui_warn("fallback")
+        },
+        ui_dim("approvals"),
+        ui_warn("guarded")
     );
     println!(
-        "{} {}",
-        ui_dim("observe"),
-        truncate_for_table(&observation_stack_summary(allowed_tools), 66)
-    );
-    println!(
-        "{} {}",
-        ui_dim("commands"),
-        truncate_for_table(
-            "help  status  health  scan  capabilities  /models  tasks  queue add/run/status/clear",
-            72
-        )
-    );
-    println!(
-        "{} {}",
-        ui_dim("example"),
-        truncate_for_table(
-            "hypr-claw run \"open firefox and summarize the current tab\"",
-            72
-        )
+        "{} {}  {} {}  {} {}",
+        ui_dim("provider"),
+        truncate_for_table(provider_name, 18),
+        ui_dim("agent"),
+        truncate_for_table(agent_name, 14),
+        ui_dim("thread"),
+        truncate_for_table(active_thread_id, 14)
     );
     println!("{}", ui_divider());
+    println!(
+        "{} {}",
+        ui_dim("ready"),
+        truncate_for_table(
+            &format!(
+                "type a task, `status`, `scan`, or `owner edit` | user={} ({})",
+                display_name, user_id
+            ),
+            92
+        )
+    );
     println!();
 }
 
 fn print_run_panel(
     prompt: &str,
-    class_label: &str,
-    max_iterations: usize,
+    _class_label: &str,
+    _max_iterations: usize,
     timeout_secs: u64,
     model: &str,
     active_tools: usize,
-    focused_tools: Option<usize>,
-    debug_mode: bool,
+    _focused_tools: Option<usize>,
+    _debug_mode: bool,
 ) {
     println!();
-    println!("{}", ui_section("Run"));
     println!(
-        "goal: {}",
+        "{} {}",
+        ui_accent("task"),
         truncate_for_table(&sanitize_single_line(prompt), 112)
     );
-    if debug_mode {
-        let focused = focused_tools
-            .map(|count| format!(" (focused {})", count))
-            .unwrap_or_default();
-        println!(
-            "{} power  {}  iter={}  timeout={}s  model={}  tools={}{}",
-            ui_dim("meta"),
-            class_label,
-            max_iterations,
-            timeout_secs,
-            short_model_name(model),
-            active_tools,
-            focused
-        );
-    }
-    println!();
-    println!("{}", ui_section("Plan"));
-    for (index, step) in plan_steps_for_class(class_label).iter().enumerate() {
-        println!("{}. {}", index + 1, step);
-    }
-    println!();
-    println!("{}", ui_section("Tools"));
-    println!("{}", ui_dim("Running agent..."));
-}
-
-fn plan_steps_for_class(class_label: &str) -> [&'static str; 3] {
-    match class_label {
-        "question" => [
-            "observe the current system state",
-            "gather the minimum evidence needed",
-            "verify the answer and report it clearly",
-        ],
-        "investigation" => [
-            "observe the current desktop and system state",
-            "inspect relevant tools and artifacts",
-            "verify findings before reporting the result",
-        ],
-        _ => [
-            "observe the current desktop and tool state",
-            "execute the next required tool action",
-            "verify the outcome and report completion",
-        ],
-    }
+    println!(
+        "{} {}  {} {}s  {} {}",
+        ui_dim("model"),
+        ui_info(&short_model_name(model)),
+        ui_dim("timeout"),
+        timeout_secs,
+        ui_dim("tools"),
+        ui_info(&active_tools.to_string())
+    );
+    println!("{}", ui_divider());
 }
 
 fn print_result_panel(response: &str, run_elapsed_ms: u64, debug_mode: bool) {
     println!();
-    println!("{}", ui_section("Result"));
+    println!(
+        "{} {}",
+        ui_success("done"),
+        ui_info(&format!("{}ms", run_elapsed_ms))
+    );
     if debug_mode {
-        println!("{} {}ms", ui_dim("elapsed"), run_elapsed_ms);
+        println!("{} completed", ui_dim("status"));
     }
     println!("{}", strip_ansi_and_controls(response));
     println!();
 }
 
+fn print_failure_panel(stop_code: &str, hint: &str, error_msg: &str) {
+    println!();
+    println!("{} {}", ui_danger("fail"), ui_danger(stop_code));
+    println!(
+        "{} {}",
+        ui_dim("error"),
+        truncate_for_table(&sanitize_single_line(error_msg), 120)
+    );
+    if !hint.is_empty() {
+        println!("{} {}", ui_dim("next"), hint);
+    }
+    println!();
+}
+
+fn render_operator_home(
+    model: &str,
+    provider_name: &str,
+    runtime_health: &hypr_claw_tools::RuntimeHealthSnapshot,
+    allowed_tools: &HashSet<String>,
+    thread_id: &str,
+    display_name: &str,
+    owner_profile: &OwnerProfile,
+    action_feed: &Arc<Mutex<Vec<String>>>,
+    last_run: Option<&LastRunSummary>,
+) {
+    print!("\x1B[2J\x1B[H");
+    println!(
+        "{} {}  {} {}  {} {}",
+        ui_title("Hypr-Claw"),
+        ui_info(&short_model_name(model)),
+        ui_dim("provider"),
+        truncate_for_table(provider_name, 18),
+        ui_dim("health"),
+        overall_health_badge(runtime_health)
+    );
+    println!(
+        "{} {}  {} {}  {} {}",
+        ui_dim("thread"),
+        truncate_for_table(thread_id, 14),
+        ui_dim("tools"),
+        ui_info(&allowed_tools.len().to_string()),
+        ui_dim("browser"),
+        if allowed_tools
+            .iter()
+            .any(|tool| tool.starts_with("browser."))
+        {
+            ui_success("ready")
+        } else {
+            ui_warn("fallback")
+        }
+    );
+    println!(
+        "{} {}  {} {}",
+        ui_dim("user"),
+        truncate_for_table(display_name, 20),
+        ui_dim("owner"),
+        truncate_for_table(
+            if owner_profile.preferred_browser.trim().is_empty() {
+                "defaults inferred"
+            } else {
+                owner_profile.preferred_browser.as_str()
+            },
+            20
+        )
+    );
+    println!("{}", ui_divider());
+
+    if let Some(last_run) = last_run {
+        println!(
+            "{} {}  {} {}",
+            ui_dim("last"),
+            truncate_for_table(&last_run.prompt, 72),
+            ui_dim("status"),
+            if last_run.status == "done" {
+                ui_success(&format!("{} {}ms", last_run.status, last_run.elapsed_ms))
+            } else {
+                ui_danger(&format!("{} {}ms", last_run.status, last_run.elapsed_ms))
+            }
+        );
+        println!(
+            "{} {}",
+            ui_dim("detail"),
+            truncate_for_table(&last_run.detail, 104)
+        );
+    } else {
+        println!(
+            "{} {}",
+            ui_dim("last"),
+            "no completed task yet | type a prompt and the agent will start working"
+        );
+    }
+    println!("{}", ui_divider());
+    println!("{}", ui_section("Live Trace"));
+    let feed_rows = action_feed
+        .lock()
+        .ok()
+        .map(|rows| rows.iter().rev().take(10).cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    if feed_rows.is_empty() {
+        println!("{}", ui_dim("waiting for the next task"));
+    } else {
+        for row in feed_rows.into_iter().rev() {
+            println!("{}", truncate_for_table(&row, 116));
+        }
+    }
+    println!("{}", ui_divider());
+    println!(
+        "{} {}",
+        ui_dim("prompt"),
+        ui_info("type a task, `status`, `scan`, `owner edit`, or `exit`")
+    );
+}
+
 fn print_stalled_panel(timeout_secs: u64, hint: &str, debug_mode: bool, error_msg: &str) {
     println!();
     println!("{}", ui_section("Agent Stalled"));
-    println!("The model could not complete the task within the time limit.");
-    println!();
-    println!("Possible causes:");
-    println!("* model reasoning failure");
-    println!("* missing tool capability");
-    println!("* unclear prompt");
-    println!();
-    println!("Suggestion:");
+    println!("The run hit the watchdog before completing the task.");
     if hint.is_empty() {
-        println!("Try rephrasing the prompt or switching models.");
+        println!("Try a narrower prompt or switch models.");
     } else {
-        println!("{}", hint);
+        println!("Next step: {}", hint);
     }
     if debug_mode {
-        println!();
         println!("{} {}s", ui_dim("timeout"), timeout_secs);
         println!(
             "{} {}",
@@ -3260,6 +3423,8 @@ fn print_help() {
     println!("    queue clear           Cancel queued items");
     println!("  {}", ui_accent("System"));
     println!("    profile               Show learned system profile");
+    println!("    owner                 Show learned owner preferences");
+    println!("    owner edit            Refresh owner preferences/context");
     println!("    scan                  Re-run system scan");
     println!("    view                  Show current CLI view mode");
     println!("    view transcript       Enable transcript panes");
@@ -4124,6 +4289,10 @@ struct OnboardingState {
     deep_scan_completed: bool,
     #[serde(default)]
     trusted_full_auto: bool,
+    #[serde(default)]
+    owner_profile: OwnerProfile,
+    #[serde(default)]
+    owner_profile_confirmed: bool,
 }
 
 impl Default for OnboardingState {
@@ -4136,8 +4305,32 @@ impl Default for OnboardingState {
             last_scan_at: None,
             deep_scan_completed: false,
             trusted_full_auto: false,
+            owner_profile: OwnerProfile::default(),
+            owner_profile_confirmed: false,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct OwnerProfile {
+    #[serde(default)]
+    preferred_browser: String,
+    #[serde(default)]
+    preferred_terminal: String,
+    #[serde(default)]
+    preferred_editor: String,
+    #[serde(default)]
+    messaging_apps: Vec<String>,
+    #[serde(default)]
+    daily_apps: Vec<String>,
+    #[serde(default)]
+    sensitive_apps: Vec<String>,
+    #[serde(default)]
+    sensitive_paths: Vec<String>,
+    #[serde(default)]
+    approval_notes: String,
+    #[serde(default)]
+    notes: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4285,51 +4478,270 @@ fn prompt_yes_no(prompt: &str, default_yes: bool) -> io::Result<bool> {
     }
 }
 
+fn prompt_csv_line(prompt: &str) -> io::Result<Vec<String>> {
+    let input = prompt_line(prompt)?;
+    Ok(input
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+fn owner_profile_is_empty(profile: &OwnerProfile) -> bool {
+    profile.preferred_browser.trim().is_empty()
+        && profile.preferred_terminal.trim().is_empty()
+        && profile.preferred_editor.trim().is_empty()
+        && profile.messaging_apps.is_empty()
+        && profile.daily_apps.is_empty()
+        && profile.sensitive_apps.is_empty()
+        && profile.sensitive_paths.is_empty()
+        && profile.approval_notes.trim().is_empty()
+        && profile.notes.trim().is_empty()
+}
+
+fn binary_exists_in_path(binary: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|dir| dir.join(binary).exists())
+}
+
+fn detect_first_available(candidates: &[&str], fallback: &str) -> String {
+    for candidate in candidates {
+        if binary_exists_in_path(candidate) {
+            return (*candidate).to_string();
+        }
+    }
+    fallback.to_string()
+}
+
+fn infer_owner_profile(existing: &OwnerProfile) -> OwnerProfile {
+    let mut profile = existing.clone();
+
+    if profile.preferred_browser.trim().is_empty() {
+        profile.preferred_browser = std::env::var("BROWSER").unwrap_or_else(|_| {
+            detect_first_available(
+                &[
+                    "firefox",
+                    "google-chrome-stable",
+                    "google-chrome",
+                    "chromium",
+                    "brave-browser",
+                ],
+                "firefox",
+            )
+        });
+    }
+    if profile.preferred_terminal.trim().is_empty() {
+        profile.preferred_terminal = std::env::var("TERMINAL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| {
+                detect_first_available(
+                    &["kitty", "alacritty", "wezterm", "gnome-terminal", "xterm"],
+                    "kitty",
+                )
+            });
+    }
+    if profile.preferred_editor.trim().is_empty() {
+        profile.preferred_editor = std::env::var("EDITOR")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| detect_first_available(&["code", "nvim", "vim", "nano"], "code"));
+    }
+
+    profile
+}
+
+fn print_owner_profile_summary(profile: &OwnerProfile) {
+    println!("\n👤 Owner Profile");
+    println!(
+        "  Browser: {}",
+        if profile.preferred_browser.trim().is_empty() {
+            "unknown"
+        } else {
+            &profile.preferred_browser
+        }
+    );
+    println!(
+        "  Terminal: {}",
+        if profile.preferred_terminal.trim().is_empty() {
+            "unknown"
+        } else {
+            &profile.preferred_terminal
+        }
+    );
+    println!(
+        "  Editor: {}",
+        if profile.preferred_editor.trim().is_empty() {
+            "unknown"
+        } else {
+            &profile.preferred_editor
+        }
+    );
+    println!(
+        "  Messaging apps: {}",
+        if profile.messaging_apps.is_empty() {
+            "none recorded".to_string()
+        } else {
+            profile.messaging_apps.join(", ")
+        }
+    );
+    println!(
+        "  Daily apps: {}",
+        if profile.daily_apps.is_empty() {
+            "none recorded".to_string()
+        } else {
+            profile.daily_apps.join(", ")
+        }
+    );
+    println!(
+        "  Sensitive apps: {}",
+        if profile.sensitive_apps.is_empty() {
+            "none recorded".to_string()
+        } else {
+            profile.sensitive_apps.join(", ")
+        }
+    );
+    println!(
+        "  Sensitive paths: {}",
+        if profile.sensitive_paths.is_empty() {
+            "none recorded".to_string()
+        } else {
+            profile.sensitive_paths.join(", ")
+        }
+    );
+    if !profile.approval_notes.trim().is_empty() {
+        println!("  Approval notes: {}", profile.approval_notes);
+    }
+    if !profile.notes.trim().is_empty() {
+        println!("  Notes: {}", profile.notes);
+    }
+    println!();
+}
+
+fn capture_owner_profile(existing: &OwnerProfile) -> io::Result<OwnerProfile> {
+    let mut profile = existing.clone();
+
+    let preferred_browser = prompt_line(&format!(
+        "Preferred browser for web tasks [{}]: ",
+        if profile.preferred_browser.trim().is_empty() {
+            "default"
+        } else {
+            profile.preferred_browser.as_str()
+        }
+    ))?;
+    if !preferred_browser.trim().is_empty() {
+        profile.preferred_browser = preferred_browser;
+    }
+
+    let preferred_terminal = prompt_line(&format!(
+        "Preferred terminal app [{}]: ",
+        if profile.preferred_terminal.trim().is_empty() {
+            "default"
+        } else {
+            profile.preferred_terminal.as_str()
+        }
+    ))?;
+    if !preferred_terminal.trim().is_empty() {
+        profile.preferred_terminal = preferred_terminal;
+    }
+
+    let preferred_editor = prompt_line(&format!(
+        "Preferred editor/IDE [{}]: ",
+        if profile.preferred_editor.trim().is_empty() {
+            "default"
+        } else {
+            profile.preferred_editor.as_str()
+        }
+    ))?;
+    if !preferred_editor.trim().is_empty() {
+        profile.preferred_editor = preferred_editor;
+    }
+
+    let messaging_apps = prompt_csv_line(
+        "Messaging apps you actively use (comma separated, e.g. telegram, whatsapp, gmail): ",
+    )?;
+    if !messaging_apps.is_empty() {
+        profile.messaging_apps = messaging_apps;
+    }
+
+    let daily_apps =
+        prompt_csv_line("Apps I should know as common daily tools (comma separated): ")?;
+    if !daily_apps.is_empty() {
+        profile.daily_apps = daily_apps;
+    }
+
+    let sensitive_apps = prompt_csv_line(
+        "Apps that should always trigger confirmation before I interact with them: ",
+    )?;
+    if !sensitive_apps.is_empty() {
+        profile.sensitive_apps = sensitive_apps;
+    }
+
+    let sensitive_paths =
+        prompt_csv_line("Paths that should always trigger confirmation before writes/reads: ")?;
+    if !sensitive_paths.is_empty() {
+        profile.sensitive_paths = sensitive_paths;
+    }
+
+    let approval_notes = prompt_line("Extra approval rules or red lines (optional): ")?;
+    if !approval_notes.trim().is_empty() {
+        profile.approval_notes = approval_notes;
+    }
+
+    let notes = prompt_line("Extra owner habits or instructions (optional): ")?;
+    if !notes.trim().is_empty() {
+        profile.notes = notes;
+    }
+
+    Ok(profile)
+}
+
+fn sync_owner_profile_facts(
+    context: &mut hypr_claw_memory::types::ContextData,
+    profile: &OwnerProfile,
+) {
+    context
+        .facts
+        .retain(|fact| !fact.starts_with("owner_profile:"));
+    let payload = serde_json::to_string(profile).unwrap_or_else(|_| "{}".to_string());
+    context.facts.push(format!("owner_profile:{}", payload));
+}
+
 async fn run_first_run_onboarding(
     user_id: &str,
     context: &mut hypr_claw_memory::types::ContextData,
     state: &mut AgentOsState,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if state.onboarding.completed {
+    let first_run = !state.onboarding.completed;
+    let needs_owner_seed = !state.onboarding.owner_profile_confirmed
+        || owner_profile_is_empty(&state.onboarding.owner_profile);
+    if !first_run && !needs_owner_seed {
         return Ok(());
     }
 
-    println!("\n🧭 First Run Onboarding");
     if state.onboarding.preferred_name.trim().is_empty() {
-        let preferred = prompt_line("What should I call you? ")?;
-        state.onboarding.preferred_name = if preferred.trim().is_empty() {
-            user_id.to_string()
-        } else {
-            preferred
-        };
+        state.onboarding.preferred_name = std::env::var("USER")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| user_id.to_string());
     }
 
     state.onboarding.trusted_full_auto = false;
 
-    if prompt_yes_no("Allow first-time system study scan? [Y/n] ", true)? {
-        let deep_scan = prompt_yes_no(
-            "Run deep system learning scan (home directory with consent)? [Y/n] ",
-            true,
-        )?;
-
-        state.onboarding.system_profile = scan::run_integrated_scan(user_id, deep_scan).await?;
-        state.onboarding.deep_scan_completed = deep_scan;
+    if first_run {
+        println!("\nQuick setup: learning basic system info.");
+        state.onboarding.system_profile = scan::run_integrated_scan(user_id, false).await?;
+        state.onboarding.deep_scan_completed = false;
         state.onboarding.last_scan_at = Some(chrono::Utc::now().timestamp());
-        print_system_profile_summary(&state.onboarding.system_profile);
+        state.onboarding.profile_confirmed = true;
+    }
 
-        loop {
-            if prompt_yes_no("Is this system profile correct? [Y/n] ", true)? {
-                state.onboarding.profile_confirmed = true;
-                break;
-            }
-            if !prompt_yes_no("Edit profile now? [Y/n] ", true)? {
-                break;
-            }
-            edit_profile_interactively(&mut state.onboarding.system_profile)?;
-            print_system_profile_summary(&state.onboarding.system_profile);
-        }
-    } else {
-        println!("ℹ️  System study skipped for now. Use `scan` later.");
+    if needs_owner_seed {
+        state.onboarding.owner_profile = infer_owner_profile(&state.onboarding.owner_profile);
+        state.onboarding.owner_profile_confirmed = true;
     }
 
     state.onboarding.completed = true;
@@ -4342,6 +4754,14 @@ async fn run_first_run_onboarding(
             "preferred_name:{}",
             state.onboarding.preferred_name
         ));
+    }
+    sync_owner_profile_facts(context, &state.onboarding.owner_profile);
+    if first_run {
+        println!(
+            "{} {}",
+            ui_dim("setup"),
+            "quick setup complete | use `scan` for deep indexing and `owner edit` for personal preferences"
+        );
     }
     Ok(())
 }
@@ -5653,6 +6073,7 @@ fn thread_session_key(base_session_key: &str, thread_id: &str) -> String {
 fn augment_system_prompt_for_turn(
     base_prompt: &str,
     profile: &Value,
+    owner_profile: &OwnerProfile,
     capability_registry: &Value,
     runtime_health: &hypr_claw_tools::RuntimeHealthSnapshot,
     allowed_tools: &HashSet<String>,
@@ -5748,7 +6169,34 @@ fn augment_system_prompt_for_turn(
         })
         .unwrap_or(0);
     let backend_health = format_runtime_health(runtime_health);
-    let intent_routing_hint = "Intent routing hints:\n- For Gmail/mail in browser, prefer desktop.open_gmail or desktop.open_url before generic app launch.\n- For YouTube/video/web targets, prefer desktop.open_url or desktop.search_web before generic app launch.\n- For Telegram/native chat apps, prefer desktop.launch_app, then verify with desktop.fast_window_state / desktop.list_windows / desktop.read_screen_state.\n- If an app launch fails, immediately switch to the next valid fallback instead of waiting.";
+    let browser_tools_available = allowed_tools.contains("browser.navigate")
+        && allowed_tools.contains("browser.snapshot")
+        && allowed_tools.contains("browser.action");
+    let owner_messaging_apps = if owner_profile.messaging_apps.is_empty() {
+        "unknown".to_string()
+    } else {
+        owner_profile.messaging_apps.join(", ")
+    };
+    let owner_daily_apps = if owner_profile.daily_apps.is_empty() {
+        "unknown".to_string()
+    } else {
+        owner_profile.daily_apps.join(", ")
+    };
+    let owner_sensitive_apps = if owner_profile.sensitive_apps.is_empty() {
+        "none".to_string()
+    } else {
+        owner_profile.sensitive_apps.join(", ")
+    };
+    let owner_sensitive_paths = if owner_profile.sensitive_paths.is_empty() {
+        "none".to_string()
+    } else {
+        owner_profile.sensitive_paths.join(", ")
+    };
+    let intent_routing_hint = if browser_tools_available {
+        "Intent routing hints:\n- For Gmail/mail, WhatsApp Web, Telegram Web, Codex, YouTube, GitHub, Calendar, Drive, and similar common apps, prefer desktop.open_workspace_app first.\n- For browser-heavy tasks, prefer browser.health -> browser.navigate -> browser.snapshot -> browser.action before pixel-based desktop automation.\n- For native Telegram or other local apps, prefer desktop.launch_app after desktop.open_workspace_app if native mode is needed.\n- If an app launch fails, immediately switch to the next valid fallback instead of waiting."
+    } else {
+        "Intent routing hints:\n- For Gmail/mail, WhatsApp, Telegram, Codex, YouTube, GitHub, Calendar, Drive, and similar common apps, prefer desktop.open_workspace_app first.\n- For Telegram/native chat apps, prefer desktop.launch_app after desktop.open_workspace_app when a native client is desired.\n- For generic web targets, prefer desktop.open_url or desktop.search_web before ad-hoc app launch.\n- If an app launch fails, immediately switch to the next valid fallback instead of waiting."
+    };
 
     let mut tools = allowed_tools.iter().cloned().collect::<Vec<String>>();
     tools.sort();
@@ -5766,7 +6214,7 @@ fn augment_system_prompt_for_turn(
     };
 
     format!(
-        "{}\n\nRuntime context:\n- autonomy_mode: {}\n- workflow_mode: {}\n- capability_registry_generated_at: {}\n- distro: {}\n- kernel: {}\n- active_workspace: {}\n- backend_health: {}\n- wallpaper_backends: {}\n- screenshot_backends: {}\n- input_backends: {}\n- vscode_hint: {}\n- launcher_commands: {}\n- preferred_launchers: {}\n- known_projects: {}\n- known_downloads_dir: {}\n- installed_packages: {}\n- allowed_tools_now: {}\n\n{}",
+        "{}\n\nRuntime context:\n- autonomy_mode: {}\n- workflow_mode: {}\n- capability_registry_generated_at: {}\n- distro: {}\n- kernel: {}\n- active_workspace: {}\n- backend_health: {}\n- wallpaper_backends: {}\n- screenshot_backends: {}\n- input_backends: {}\n- owner_preferred_browser: {}\n- owner_preferred_terminal: {}\n- owner_preferred_editor: {}\n- owner_messaging_apps: {}\n- owner_daily_apps: {}\n- owner_sensitive_apps: {}\n- owner_sensitive_paths: {}\n- owner_approval_notes: {}\n- owner_notes: {}\n- vscode_hint: {}\n- launcher_commands: {}\n- preferred_launchers: {}\n- known_projects: {}\n- known_downloads_dir: {}\n- installed_packages: {}\n- allowed_tools_now: {}\n\n{}",
         base_prompt,
         autonomy_mode.as_str(),
         if strict_workflow_enabled() { "strict" } else { "legacy" },
@@ -5778,6 +6226,35 @@ fn augment_system_prompt_for_turn(
         list_from_registry("/capabilities/wallpaper_backends", "/capabilities/wallpaper_backends"),
         list_from_registry("/capabilities/screenshot_backends", "/capabilities/screenshot_backends"),
         list_from_registry("/capabilities/input_backends", "/capabilities/input_backends"),
+        if owner_profile.preferred_browser.trim().is_empty() {
+            "unknown"
+        } else {
+            owner_profile.preferred_browser.as_str()
+        },
+        if owner_profile.preferred_terminal.trim().is_empty() {
+            "unknown"
+        } else {
+            owner_profile.preferred_terminal.as_str()
+        },
+        if owner_profile.preferred_editor.trim().is_empty() {
+            "unknown"
+        } else {
+            owner_profile.preferred_editor.as_str()
+        },
+        owner_messaging_apps,
+        owner_daily_apps,
+        owner_sensitive_apps,
+        owner_sensitive_paths,
+        if owner_profile.approval_notes.trim().is_empty() {
+            "none"
+        } else {
+            owner_profile.approval_notes.as_str()
+        },
+        if owner_profile.notes.trim().is_empty() {
+            "none"
+        } else {
+            owner_profile.notes.as_str()
+        },
         vscode_hint,
         launcher_hints,
         preferred_launchers,
@@ -5808,6 +6285,8 @@ fn focused_tools_for_input(input: &str, allowed: &HashSet<String>) -> HashSet<St
     };
 
     let telegram_intent = lower.contains("telegram");
+    let whatsapp_intent = lower.contains("whatsapp");
+    let codex_intent = lower.contains("codex") || lower.contains("chatgpt");
     let gmail_intent = lower.contains("gmail") || lower.contains("mail") || lower.contains("inbox");
     let youtube_intent = lower.contains("youtube")
         || lower.contains("youtu.be")
@@ -5821,6 +6300,8 @@ fn focused_tools_for_input(input: &str, allowed: &HashSet<String>) -> HashSet<St
         || lower.contains("url")
         || lower.contains("link")
         || gmail_intent
+        || whatsapp_intent
+        || codex_intent
         || youtube_intent;
     let reading_intent = lower.contains("summaris")
         || lower.contains("recent")
@@ -5859,22 +6340,37 @@ fn focused_tools_for_input(input: &str, allowed: &HashSet<String>) -> HashSet<St
         add(&mut preferred, "fs.move", allowed);
     }
 
-    if lower.contains("open") || web_intent || telegram_intent {
+    if lower.contains("open") || web_intent || telegram_intent || whatsapp_intent || codex_intent {
         add_observation_tools(&mut preferred, allowed);
+        add(&mut preferred, "desktop.open_workspace_app", allowed);
+        add(&mut preferred, "browser.health", allowed);
+        add(&mut preferred, "browser.navigate", allowed);
+        add(&mut preferred, "browser.snapshot", allowed);
+        add(&mut preferred, "browser.action", allowed);
+        add(&mut preferred, "browser.evaluate", allowed);
+        add(&mut preferred, "browser.screenshot", allowed);
         add(&mut preferred, "desktop.launch_app", allowed);
         add(&mut preferred, "hypr.window.focus", allowed);
         add(&mut preferred, "hypr.workspace.switch", allowed);
         if gmail_intent {
+            add(&mut preferred, "desktop.open_workspace_app", allowed);
             add(&mut preferred, "desktop.open_gmail", allowed);
             add(&mut preferred, "desktop.open_url", allowed);
             add(&mut preferred, "desktop.search_web", allowed);
+        } else if whatsapp_intent || codex_intent {
+            add(&mut preferred, "desktop.open_workspace_app", allowed);
+            add(&mut preferred, "desktop.open_url", allowed);
+            add(&mut preferred, "desktop.search_web", allowed);
         } else if youtube_intent {
+            add(&mut preferred, "desktop.open_workspace_app", allowed);
             add(&mut preferred, "desktop.open_url", allowed);
             add(&mut preferred, "desktop.search_web", allowed);
         } else if web_intent {
+            add(&mut preferred, "desktop.open_workspace_app", allowed);
             add(&mut preferred, "desktop.search_web", allowed);
             add(&mut preferred, "desktop.open_url", allowed);
         } else {
+            add(&mut preferred, "desktop.open_workspace_app", allowed);
             add(&mut preferred, "desktop.open_url", allowed);
             add(&mut preferred, "desktop.search_web", allowed);
         }
@@ -5987,12 +6483,20 @@ fn fallback_playbook_for_input(input: &str, allowed: &HashSet<String>) -> String
     if desktop_intent {
         let desktop_fallbacks = if lower.contains("gmail")
             || lower.contains("mail")
+            || lower.contains("whatsapp")
+            || lower.contains("codex")
+            || lower.contains("chatgpt")
             || lower.contains("youtube")
             || lower.contains("rickroll")
             || lower.contains("rick roll")
             || lower.contains("yt ")
         {
             vec![
+                "desktop.open_workspace_app",
+                "browser.health",
+                "browser.navigate",
+                "browser.snapshot",
+                "browser.action",
                 "desktop.open_url",
                 "desktop.search_web",
                 "desktop.launch_app",
@@ -6001,6 +6505,7 @@ fn fallback_playbook_for_input(input: &str, allowed: &HashSet<String>) -> String
             ]
         } else {
             vec![
+                "desktop.open_workspace_app",
                 "desktop.launch_app",
                 "desktop.open_url",
                 "proc.spawn",
@@ -6147,7 +6652,9 @@ impl RuntimeDispatcherAdapter {
     }
 
     fn print_iteration(&self, index: u64) {
-        println!("{}", ui_dim(&format!("iteration {}", index)));
+        if self.debug_mode {
+            println!("{}", ui_dim(&format!("iter {}", index)));
+        }
     }
 
     fn print_action(&self, session_key: &str, line: &str) {
@@ -6156,12 +6663,12 @@ impl RuntimeDispatcherAdapter {
     }
 
     fn tool_success_line(&self, tool_name: &str, elapsed_ms: u128) -> String {
-        format!("TOOL {} ({}ms) ✔", tool_name, elapsed_ms)
+        format!("[ok    ] {:<24} {}ms", tool_name, elapsed_ms)
     }
 
     fn tool_failure_line(&self, tool_name: &str, elapsed_ms: u128, detail: &str) -> String {
         let detail = truncate_for_table(&sanitize_single_line(detail), 96);
-        format!("TOOL {} ({}ms) ✖ {}", tool_name, elapsed_ms, detail)
+        format!("[fail  ] {:<24} {}ms {}", tool_name, elapsed_ms, detail)
     }
 
     fn print_debug_payload(&self, label: &str, value: &serde_json::Value) {
@@ -6263,6 +6770,21 @@ fn fallback_tools_for_tool(tool_name: &str) -> Vec<&'static str> {
     match tool_name {
         "wallpaper.set" => vec!["hypr.exec"],
         "desktop.open_gmail" => vec!["desktop.open_url", "desktop.launch_app"],
+        "desktop.open_workspace_app" => vec![
+            "browser.navigate",
+            "desktop.open_url",
+            "desktop.search_web",
+            "desktop.launch_app",
+        ],
+        "browser.navigate" => vec!["browser.snapshot", "browser.action", "desktop.open_url"],
+        "browser.snapshot" => vec!["browser.screenshot", "desktop.read_screen_state"],
+        "browser.action" => vec![
+            "browser.snapshot",
+            "desktop.click_text",
+            "desktop.click_at_and_verify",
+        ],
+        "browser.evaluate" => vec!["browser.snapshot", "browser.screenshot"],
+        "browser.screenshot" => vec!["browser.snapshot", "desktop.capture_screen"],
         "desktop.open_url" => vec!["desktop.search_web", "desktop.launch_app"],
         "desktop.launch_app" => vec!["proc.spawn", "hypr.exec"],
         "proc.spawn" => vec!["hypr.exec", "desktop.launch_app"],

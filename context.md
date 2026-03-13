@@ -2,164 +2,343 @@
 
 Last updated: 2026-03-13
 
-## Purpose
+This is the current handoff document for the repo. New agents should read this first, then read the referenced files before making changes.
 
-Hypr-Claw is a local Linux OS operator focused on Hyprland workflows. The user gives a prompt, and the agent should execute real desktop work end-to-end with tools, verification, and clear results.
+## What This Project Is
 
-This file is the shared context for all future model contributors. Read this first before changing code.
+Hypr-Claw is trying to become a real local OS assistant for Linux/Hyprland:
+- user gives one prompt
+- model understands the task
+- model gathers context automatically when possible
+- model asks the user only when missing context is important or the action is high-impact
+- model uses tools to operate the desktop/browser/files/processes
+- model verifies progress after each action and continues until done
 
-## Product Ideology
+The target is not “chat about actions”. The target is “complete the work”.
 
-1. One powerful mode.
-   The project intentionally uses a single power-agent workflow. Do not reintroduce multiple personalities, dashboard mode, or trust/safe mode toggles.
-2. Prompt decides behavior.
-   Avoid hardcoded step trees for specific tasks. The model should choose tools dynamically from runtime-allowed capabilities.
-3. Observe, act, verify.
-   Every GUI task should follow strict loop: observe current state, execute one decisive action, verify state change, continue.
-4. Reliability over feature count.
-   A smaller set of tools that actually works is better than many brittle tools.
-5. Freedom with accountability.
-   Keep explicit permission prompts for high-impact/destructive actions and keep auditable execution history.
+## Product Direction
 
-## End Product Target
+Keep these constraints:
 
-Build a dependable local OS assistant that can perform normal human desktop work:
-- browser workflows (mail, research, forms)
-- messaging and communication actions
-- coding and project operations
-- file and system tasks
-- multi-step workflows with minimal user intervention
+1. Single power workflow.
+- Do not reintroduce multiple personalities, “safe mode”, or old dashboard/soul systems.
 
-Success standard: user prompt -> completed outcome, not just "opened app" or "cannot proceed."
+2. Tool-driven execution.
+- The model should act through tools, not produce explanation-only responses for feasible tasks.
 
-## Current State (Important)
+3. Observe -> plan -> execute -> verify.
+- This loop is the core behavior for GUI/browser work.
 
-1. Runtime
-- CLI-first assistant with single power-agent profile.
-- Strict workflow language is already in system prompt.
-- Capability registry filters tools by detected machine capabilities.
+4. Explicit approvals for serious actions.
+- Sending messages, typing into unknown forms, destructive file/process actions, and system-impacting operations should pause for confirmation.
 
-2. Scanning and context
-- Onboarding includes standard/deep scan modes.
-- Registry and profile are persisted under `data/`.
-- Deep scan can be expensive; current strategy should move toward summary-first and on-demand deep reads.
+5. Context should come from both machine and owner.
+- Machine profile: configs, Hyprland, capabilities, runtime health.
+- Owner profile: preferred browser/editor/terminal/apps, sensitive apps/paths, approval notes.
 
-3. GUI tooling
-- Desktop tools include window listing, active window, screenshot, OCR, keyboard, mouse, app launch, and URL open.
-- New non-OCR tools exist for stronger control:
-  - `desktop.cursor_position`
-  - `desktop.mouse_move_and_verify`
-  - `desktop.click_at_and_verify`
-  - `desktop.read_screen_state`
-- Live runtime backend health probing now exists:
-  - `desktop.health_status`
-  - startup tool filtering now combines persisted scan data with current backend readiness
-- Runtime tool gating now differentiates keyboard vs pointer backends.
+## Current Architecture
 
-4. UX
-- Transcript and compact views exist.
-- Output readability still needs significant refinement (reduce clutter, stronger hierarchy, better progress signaling).
+- [hypr-claw-app/src/main.rs](/home/rick/hyprclaw/hypr-claw-app/src/main.rs)
+  Main CLI, onboarding, prompt assembly, runtime orchestration, UI rendering.
+- [hypr-claw-app/src/tool_setup.rs](/home/rick/hyprclaw/hypr-claw-app/src/tool_setup.rs)
+  Tool registry construction.
+- [hypr-claw-app/src/debug_timeline.rs](/home/rick/hyprclaw/hypr-claw-app/src/debug_timeline.rs)
+  New live debug/timeline observer added in this pass.
+- [hypr-claw-runtime/src/agent_loop.rs](/home/rick/hyprclaw/hypr-claw-runtime/src/agent_loop.rs)
+  Main LLM + tool execution loop.
+- [hypr-claw-tools/src/os_tools.rs](/home/rick/hyprclaw/hypr-claw-tools/src/os_tools.rs)
+  Desktop tools and new Pinchtab-backed browser tools.
+- [hypr-claw-infra/src/infra/permission_adapter.rs](/home/rick/hyprclaw/hypr-claw-infra/src/infra/permission_adapter.rs)
+  Approval/risk adaptation layer.
 
-## Known Gaps Blocking Quality
+## Important Recent Changes
 
-1. Mouse backend reliability on Linux/Wayland is still environment-sensitive.
-- Example: `ydotoold` may fail without `uinput` permissions.
-- Tool availability should reflect executable reality, not only binary presence.
+### 1. Browser tool family exists now
 
-2. Some model responses still stop at policy-style refusals even when task is feasible via GUI automation.
-- Need stronger execution policy to force full attempt before declaring blocked.
+Added Pinchtab-backed:
+- `browser.health`
+- `browser.navigate`
+- `browser.snapshot`
+- `browser.action`
+- `browser.evaluate`
+- `browser.screenshot`
 
-3. CLI UX is functional but visually noisy.
-- Repeated panels, dense logs, and duplicated response blocks reduce readability.
+Main files:
+- [os_tools.rs](/home/rick/hyprclaw/hypr-claw-tools/src/os_tools.rs)
+- [tool_setup.rs](/home/rick/hyprclaw/hypr-claw-app/src/tool_setup.rs)
 
-4. Deep scan performance and context bloat.
-- Need index/summarize-first scanning with demand-driven full reads.
+Notes:
+- These use HTTP to a Pinchtab service.
+- They expect `PINCHTAB_URL` and optionally `PINCHTAB_TOKEN`.
+- Default base URL is `http://127.0.0.1:9867`.
 
-## What To Build Next
+### 2. Onboarding is now much lighter
 
-### Phase 1: Reliability Foundation (highest priority)
+First-run setup no longer asks for a long interactive scan/profile session.
 
-1. Backend truth checks
-- Runtime health probes now exist for Hyprland, screenshot, OCR, keyboard, and pointer backends.
-- Tool exposure is now filtered by both stored capabilities and live backend readiness.
-- Next step: strengthen “degraded” detection for backends like `ydotool` where daemon/uinput access can still fail at action time.
+Current behavior:
+- runs a basic system scan automatically
+- infers owner defaults from environment and installed binaries
+- marks onboarding complete
+- defers deep scan to `scan`
+- defers personal tuning to `owner edit`
 
-2. Deterministic GUI action loop
-- Standardize action cycle:
-  - `desktop.read_screen_state`
-  - decide action
-  - `mouse_move_and_verify` / `click_at_and_verify` / keyboard action
-  - re-read and verify goal progress
+This was done to get the user into the agent loop faster.
 
-3. Strong failure handling
-- Each tool failure must produce fallback suggestion and auto-fallback path (not silent dead-end).
+### 3. Owner profile / manual context exists now
 
-### Phase 2: Scan and Memory Performance
+Added owner-profile onboarding and editing:
+- preferred browser
+- preferred terminal
+- preferred editor
+- messaging apps
+- daily apps
+- sensitive apps
+- sensitive paths
+- approval notes
+- general notes
 
-1. Two-layer scan model
-- Permanent context: stable system facts, configs, package summary, capability profile.
-- Temporary context: recent tasks/artifacts/screen workflow traces.
+Commands:
+- `owner`
+- `owner edit`
 
-2. Smart ingestion
-- Build file index and metadata first.
-- Read full file contents only when required by user task or conflict resolution.
-- Maintain freshness hashes/timestamps to avoid repeat heavy scans.
+Main file:
+- [main.rs](/home/rick/hyprclaw/hypr-claw-app/src/main.rs)
 
-3. Context compression
-- Periodically compress temporary context into short summaries and keep links to raw artifacts.
+### 4. Common app opening is more direct now
 
-### Phase 3: UX and Adoption
+Added:
+- `desktop.open_workspace_app`
 
-1. Default interface should be clean chat-first.
-- Minimal header.
-- Single progress line during execution.
-- Tool logs collapsed by default, expandable on demand.
+This tool resolves common targets in one step instead of forcing the model to invent URLs/app names each time.
 
-2. Shareable run artifacts.
-- Export a run summary timeline that users can paste/share.
+Current built-in targets include:
+- Gmail
+- WhatsApp
+- Telegram
+- Codex / ChatGPT
+- YouTube
+- GitHub
+- Google Calendar
+- Google Drive
+- Google Docs / Sheets / Slides
+- Spotify
+- a few native apps like Firefox, terminal, code, file manager
 
-3. Task quality benchmarks.
-- Maintain a top-task benchmark suite (mail triage, browser research, coding flow, file ops).
-- Track success rate, median latency, recovery count.
+It also accepts `query` and `prefer_native` and falls back to web search for unknown app names.
 
-## Architecture Snapshot
+Files:
+- [os_tools.rs](/home/rick/hyprclaw/hypr-claw-tools/src/os_tools.rs)
+- [tool_setup.rs](/home/rick/hyprclaw/hypr-claw-app/src/tool_setup.rs)
+- [main.rs](/home/rick/hyprclaw/hypr-claw-app/src/main.rs)
 
-- `hypr-claw-app/`: CLI entrypoint, onboarding, command loop, capability registry, prompt assembly.
-- `hypr-claw-runtime/`: execution loop and orchestration logic.
-- `hypr-claw-tools/`: OS tools and desktop capability adapters.
-- `hypr-claw-infra/`: permissions, audit, session/lock infrastructure.
-- `crates/`: shared platform modules (`core`, `memory`, `providers`, `policy`, `tasks`, etc.).
+### 5. Prompt/runtime now uses owner + browser context
 
-## Contributor Protocol (How Models Should Work)
+`augment_system_prompt_for_turn(...)` now includes:
+- owner preferences
+- owner approval notes
+- browser tool availability
+- stronger routing hints for browser tasks like Gmail, WhatsApp Web, Telegram Web, Codex
 
-1. Read order before coding
-- Read `context.md`, then `README.md`, then target files.
+This means the runtime should prefer browser tools before pixel-only automation for browser-heavy tasks.
 
-2. Preserve direction
-- Do not add back removed systems (soul switching, dashboard, autonomy/safe mode splits).
-- Keep one-mode power workflow.
+### 6. Interactive mode now has a single-screen operator home
 
-3. Keep changes pragmatic
-- Prefer small, testable edits over broad rewrites.
-- Remove dead code paths when confidently obsolete.
+The interactive session no longer just accumulates prints forever between prompts.
 
-4. Make tool behavior observable
-- Improve logs/transcript with clear tool call, outcome, and verification state.
-- Avoid hidden implicit state transitions.
+Current behavior:
+- clears to a single operator screen between runs
+- shows model/provider/health/tools/thread
+- shows last task result or failure summary
+- shows recent live trace tail
+- uses a minimal `›` prompt
 
-5. Validate before handing off
-- Run:
-  - `cargo check -p hypr_claw_tools`
-  - `cargo check -p hypr-claw-app`
-- Run focused tests when touching execution/tool logic.
+This is still ANSI-rendered terminal UI, not a full ratatui/crossterm dashboard, but it is much closer to a real operator console than the old scrollback-heavy loop.
 
-6. If blocked, report precisely
-- State exact blocker (backend, permission, missing dependency, design ambiguity).
-- Provide smallest next action to unblock.
+Key file:
+- [main.rs](/home/rick/hyprclaw/hypr-claw-app/src/main.rs)
 
-## Definition of Done For New Work
+### 7. CLI is simpler and more agent-like now
 
-A change is complete only if:
-1. It improves real task completion rate or execution clarity.
-2. Runtime behavior matches this ideology (observe-act-verify, dynamic tools, explicit permission for high-impact actions).
-3. It passes compile checks and does not regress existing workflows.
+Added a live operator timeline observer:
+- stages like `task`, `think`, `tool`, `state`, `done`, `fail`, `error`
+- streamed directly during runs
+- integrated with the existing debug event system
+
+Files:
+- [debug_timeline.rs](/home/rick/hyprclaw/hypr-claw-app/src/debug_timeline.rs)
+- [main.rs](/home/rick/hyprclaw/hypr-claw-app/src/main.rs)
+
+The current console is intentionally much lighter:
+- short boot summary
+- short task header
+- live trace lines
+- compact success/failure ending
+- single-screen home between tasks
+
+There is still no full-screen TUI. This is a simplified operator CLI, not a real terminal dashboard.
+
+### 8. Approval UX is improved
+
+Approvals are no longer only “Approve action [y/N]”.
+
+The permission adapter now classifies risk for actions such as:
+- `browser.action`
+- `desktop.type_text`
+- risky key presses / key combos
+- sensitive `fs.write`
+- `proc.kill`
+- `hypr.exec`
+- shutdown/reboot/system-impacting operations
+
+The prompt now shows:
+- risk
+- tool
+- reason
+- summarized input
+- timeout
+
+File:
+- [permission_adapter.rs](/home/rick/hyprclaw/hypr-claw-infra/src/infra/permission_adapter.rs)
+
+## How The Runtime Currently Works
+
+High-level path:
+
+1. CLI input reaches [main.rs](/home/rick/hyprclaw/hypr-claw-app/src/main.rs)
+2. Runtime builds allowed tool set from:
+- capability registry
+- live runtime health
+3. `focused_tools_for_input(...)` narrows tool set for some task classes and now strongly prefers `desktop.open_workspace_app` for common app targets
+4. `augment_system_prompt_for_turn(...)` injects:
+- machine context
+- owner context
+- capability info
+- workflow rules
+5. [agent_loop.rs](/home/rick/hyprclaw/hypr-claw-runtime/src/agent_loop.rs) runs the LLM/tool loop
+6. Tool calls go through `RuntimeDispatcherAdapter` in [main.rs](/home/rick/hyprclaw/hypr-claw-app/src/main.rs)
+7. Permission checks go through infra adapter
+8. Debug events now feed the live timeline observer
+
+## Verified State
+
+These checks passed after the current changes:
+
+```bash
+cargo fmt --all
+cargo check -p hypr-claw-app
+cargo test -p hypr_claw permission_adapter -- --nocapture
+cargo check -p hypr_claw_tools -p hypr-claw-app
+```
+
+Known warnings still exist in scan parser code and are not from the recent changes:
+- [mod.rs](/home/rick/hyprclaw/hypr-claw-app/src/scan/parsers/mod.rs#L3)
+- [hyprland.rs](/home/rick/hyprclaw/hypr-claw-app/src/scan/parsers/hyprland.rs#L5)
+
+## Current Weak Points
+
+These are still open:
+
+1. No full app-specific adapters yet.
+- `desktop.open_workspace_app` helps a lot, but there are still no dedicated `gmail.*`, `whatsapp.*`, `telegram.*`, `codex.*` workflow tools.
+
+2. No self-tool-generation workflow.
+- The project still cannot safely detect a missing tool, propose it, get approval, create it, verify it, then use it.
+
+3. No true hackathon-grade TUI/web console yet.
+- The CLI is better, but still not a split-pane operator dashboard with previews and approval cards.
+
+4. Approval persistence is missing.
+- Approvals are per-action CLI prompts. There is no reusable grant model.
+
+5. Browser tools depend on Pinchtab actually running.
+- If Pinchtab is unavailable, the system falls back to desktop/browser pixel flows.
+
+6. “Perfect OS assistant” behavior is not done.
+- The foundations are stronger, but not every prompt can yet be completed end-to-end reliably.
+
+## Best Next Work
+
+If another agent continues, do these in this order:
+
+1. Build a real demo UI.
+- Split-pane terminal UI or local web UI.
+- Show live task, current tool, approvals, recent timeline, transcript, and maybe screenshot/snapshot preview.
+
+2. Add app adapters on top of browser tools and `desktop.open_workspace_app`.
+- `gmail.open`, `gmail.read_threads`, `gmail.compose`
+- `whatsapp.open_chat`, `whatsapp.read_recent`, `whatsapp.send_message`
+- `telegram.open_chat`, `telegram.read_recent`, `telegram.send_message`
+- `codex.open`, `codex.prompt`, `codex.capture_response`
+
+3. Upgrade approval model.
+- Persist approvals.
+- Add scoped grants.
+- Separate “observe allowed” from “act requires confirmation”.
+
+4. Add missing-capability flow.
+- If model needs a tool that does not exist, it should surface a proposal instead of failing vaguely.
+
+5. Improve runtime latency.
+- Current loop still does extra work and the UI is event-based but not optimized for minimal delay.
+
+## Practical Notes For Future Agents
+
+### Repo state
+
+There are already local modifications in progress across:
+- `hypr-claw-app`
+- `hypr-claw-tools`
+- `hypr-claw-infra`
+
+Do not revert unrelated changes blindly.
+
+There are also local vendored directories:
+- `pinchtab/`
+- `picoclaw/`
+
+They are useful reference implementations. The user explicitly wants this project to borrow ideas/capabilities from them.
+
+### Package names
+
+Useful workspace package names:
+- `hypr-claw-app`
+- `hypr_claw`
+- `hypr_claw_tools`
+- `hypr-claw-runtime`
+
+### Commands worth using
+
+```bash
+cargo check -p hypr-claw-app
+cargo check -p hypr_claw
+cargo check -p hypr_claw_tools
+cargo check -p hypr_claw_tools -p hypr-claw-app
+cargo test -p hypr_claw permission_adapter -- --nocapture
+```
+
+### Search starting points
+
+Use these when resuming:
+- `augment_system_prompt_for_turn`
+- `focused_tools_for_input`
+- `desktop.open_workspace_app`
+- `RuntimeDispatcherAdapter`
+- `derive_runtime_allowed_tools`
+- `BrowserActionTool`
+- `OwnerProfile`
+- `TimelineDebugObserver`
+- `classify_permission_request`
+
+## Do Not Lose This Direction
+
+The user wants:
+- one prompt interface
+- broad OS control
+- browser + desktop + app operation
+- context gathered automatically first, manually when needed
+- strong tool use
+- approval for serious actions
+- a polished hackathon-grade presentation
+
+The current codebase is now closer to that, but not finished. Continue from the runtime/UI/approval/browser direction rather than adding unrelated abstractions.

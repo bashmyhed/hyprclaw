@@ -276,10 +276,13 @@ mod tests {
         assert!(result.is_error);
         assert_eq!(result.error_kind.as_deref(), Some("approval_required"));
         assert_eq!(result.user_message(), Some("Need confirmation"));
-        assert_eq!(result.output, Some(json!({
-            "approval_required": true,
-            "message": "Need confirmation"
-        })));
+        assert_eq!(
+            result.output,
+            Some(json!({
+                "approval_required": true,
+                "message": "Need confirmation"
+            }))
+        );
     }
 
     #[test]

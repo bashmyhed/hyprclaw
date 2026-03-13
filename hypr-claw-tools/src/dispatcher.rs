@@ -1,8 +1,8 @@
 use crate::error::ToolError;
 use crate::pipeline::{
-    AuditStage, ExecutionStage, InputValidationStage, PermissionStage,
-    RecoveryClassificationStage, ResultNormalizationStage, SafetyPolicyStage,
-    ToolDispatchContext, ToolDispatchRequest, VisibilityStage,
+    AuditStage, ExecutionStage, InputValidationStage, PermissionStage, RecoveryClassificationStage,
+    ResultNormalizationStage, SafetyPolicyStage, ToolDispatchContext, ToolDispatchRequest,
+    VisibilityStage,
 };
 use crate::registry::ToolRegistryImpl;
 use crate::tools::ToolResult;
@@ -54,10 +54,7 @@ impl ToolDispatcherImpl {
         result
     }
 
-    async fn dispatch_inner(
-        &self,
-        ctx: &mut ToolDispatchContext,
-    ) -> Result<ToolResult, ToolError> {
+    async fn dispatch_inner(&self, ctx: &mut ToolDispatchContext) -> Result<ToolResult, ToolError> {
         VisibilityStage::new(&self.registry).run(ctx)?;
         InputValidationStage.run(ctx)?;
         SafetyPolicyStage.run(ctx)?;

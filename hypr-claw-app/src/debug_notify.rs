@@ -97,7 +97,10 @@ fn truncate_single_line(value: &str, max_len: usize) -> String {
     if collapsed.chars().count() <= max_len {
         collapsed
     } else {
-        let mut truncated = collapsed.chars().take(max_len.saturating_sub(1)).collect::<String>();
+        let mut truncated = collapsed
+            .chars()
+            .take(max_len.saturating_sub(1))
+            .collect::<String>();
         truncated.push('…');
         truncated
     }
@@ -107,7 +110,10 @@ fn truncate_multiline(value: &str, max_len: usize) -> String {
     if value.chars().count() <= max_len {
         value.to_string()
     } else {
-        let mut truncated = value.chars().take(max_len.saturating_sub(1)).collect::<String>();
+        let mut truncated = value
+            .chars()
+            .take(max_len.saturating_sub(1))
+            .collect::<String>();
         truncated.push('…');
         truncated
     }

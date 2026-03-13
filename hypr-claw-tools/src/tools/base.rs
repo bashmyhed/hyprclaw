@@ -90,10 +90,9 @@ impl ToolResult {
     }
 
     pub fn effective_error_message(&self) -> Option<String> {
-        self.error.clone().or_else(|| {
-            self.is_error
-                .then(|| "Tool execution failed".to_string())
-        })
+        self.error
+            .clone()
+            .or_else(|| self.is_error.then(|| "Tool execution failed".to_string()))
     }
 
     pub fn is_effective_success(&self) -> bool {

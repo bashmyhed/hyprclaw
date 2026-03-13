@@ -201,7 +201,9 @@ impl Tool for Fs2WriteTool {
             .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
-        Ok(ToolResult::success(json!({"path": input.path, "written": true})))
+        Ok(ToolResult::success(
+            json!({"path": input.path, "written": true}),
+        ))
     }
 }
 
@@ -279,7 +281,9 @@ impl Tool for Fs2ListTool {
             }));
         }
 
-        Ok(ToolResult::success(json!({"path": input.path, "entries": entries})))
+        Ok(ToolResult::success(
+            json!({"path": input.path, "entries": entries}),
+        ))
     }
 }
 
@@ -356,7 +360,9 @@ impl Tool for Fs2EditTool {
         let updated = content.replacen(&input.old_text, &input.new_text, 1);
         write_atomic(&path, updated.as_bytes()).await?;
 
-        Ok(ToolResult::success(json!({"path": input.path, "edited": true})))
+        Ok(ToolResult::success(
+            json!({"path": input.path, "edited": true}),
+        ))
     }
 }
 
@@ -424,7 +430,9 @@ impl Tool for Fs2AppendTool {
         updated.extend_from_slice(input.content.as_bytes());
         write_atomic(&path, &updated).await?;
 
-        Ok(ToolResult::success(json!({"path": input.path, "appended": true})))
+        Ok(ToolResult::success(
+            json!({"path": input.path, "appended": true}),
+        ))
     }
 }
 
@@ -463,9 +471,12 @@ mod tests {
     #[tokio::test]
     async fn fs2_read_supports_pagination() {
         let sandbox = tempdir().unwrap();
-        fs::write(sandbox.path().join("note.txt"), "abcdefghijklmnopqrstuvwxyz")
-            .await
-            .unwrap();
+        fs::write(
+            sandbox.path().join("note.txt"),
+            "abcdefghijklmnopqrstuvwxyz",
+        )
+        .await
+        .unwrap();
         let tool = Fs2ReadTool::new(sandbox.path().to_str().unwrap()).unwrap();
 
         let result = tool
@@ -482,7 +493,9 @@ mod tests {
     #[tokio::test]
     async fn fs2_edit_requires_unique_match() {
         let sandbox = tempdir().unwrap();
-        fs::write(sandbox.path().join("note.txt"), "same same").await.unwrap();
+        fs::write(sandbox.path().join("note.txt"), "same same")
+            .await
+            .unwrap();
         let tool = Fs2EditTool::new(sandbox.path().to_str().unwrap()).unwrap();
 
         let error = tool
@@ -499,15 +512,14 @@ mod tests {
     #[tokio::test]
     async fn fs2_append_extends_existing_file() {
         let sandbox = tempdir().unwrap();
-        fs::write(sandbox.path().join("note.txt"), "hello").await.unwrap();
+        fs::write(sandbox.path().join("note.txt"), "hello")
+            .await
+            .unwrap();
         let tool = Fs2AppendTool::new(sandbox.path().to_str().unwrap()).unwrap();
 
-        tool.execute(
-            test_ctx(),
-            json!({"path": "note.txt", "content": " world"}),
-        )
-        .await
-        .unwrap();
+        tool.execute(test_ctx(), json!({"path": "note.txt", "content": " world"}))
+            .await
+            .unwrap();
 
         let content = fs::read_to_string(sandbox.path().join("note.txt"))
             .await

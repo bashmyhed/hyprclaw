@@ -192,7 +192,10 @@ impl Tool for HiddenToolSearchBm25Tool {
 }
 
 fn promote_matches(registry: &ToolRegistryImpl, matches: &[HiddenToolDoc], ttl: usize) {
-    let names = matches.iter().map(|doc| doc.name.clone()).collect::<Vec<_>>();
+    let names = matches
+        .iter()
+        .map(|doc| doc.name.clone())
+        .collect::<Vec<_>>();
     if !names.is_empty() {
         registry.promote_tools(&names, ttl);
     }
@@ -256,7 +259,10 @@ mod tests {
             .await
             .unwrap();
 
-        let matches = result.output.unwrap()["matches"].as_array().unwrap().clone();
+        let matches = result.output.unwrap()["matches"]
+            .as_array()
+            .unwrap()
+            .clone();
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0]["name"], "echo");
     }

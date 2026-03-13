@@ -52,14 +52,10 @@ impl ToolRegistryImpl {
     }
 
     fn insert(&mut self, tool: Arc<dyn Tool>, is_core: bool, ttl: usize) {
-        self.tools.write().expect("registry poisoned").insert(
-            tool.name().to_string(),
-            ToolEntry {
-                tool,
-                is_core,
-                ttl,
-            },
-        );
+        self.tools
+            .write()
+            .expect("registry poisoned")
+            .insert(tool.name().to_string(), ToolEntry { tool, is_core, ttl });
         self.version.fetch_add(1, Ordering::SeqCst);
     }
 
@@ -118,12 +114,12 @@ impl ToolRegistryImpl {
             .expect("registry poisoned")
             .get(name)
             .and_then(|entry| {
-            if entry.is_core || entry.ttl > 0 {
-                Some(entry.tool.clone())
-            } else {
-                None
-            }
-        })
+                if entry.is_core || entry.ttl > 0 {
+                    Some(entry.tool.clone())
+                } else {
+                    None
+                }
+            })
     }
 
     pub fn list(&self) -> Vec<String> {

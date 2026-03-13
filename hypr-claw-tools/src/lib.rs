@@ -20,8 +20,8 @@ pub use error::ToolError;
 pub use execution_context::ExecutionContext;
 pub use fast_window_state::DesktopFastWindowStateTool;
 pub use imported::{
-    Fs2AppendTool, Fs2EditTool, Fs2ListTool, Fs2ReadTool, Fs2WriteTool,
-    HiddenToolSearchBm25Tool, HiddenToolSearchRegexTool,
+    Fs2AppendTool, Fs2EditTool, Fs2ListTool, Fs2ReadTool, Fs2WriteTool, HiddenToolSearchBm25Tool,
+    HiddenToolSearchRegexTool,
 };
 pub use registry::ToolRegistryImpl;
 pub use runtime_health::{probe_runtime_health, BackendStatus, RuntimeHealthSnapshot};

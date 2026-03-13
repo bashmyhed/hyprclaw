@@ -19,21 +19,21 @@ pub fn build_tool_registry() -> anyhow::Result<hypr_claw_tools::ToolRegistryImpl
     registry.register(Arc::new(hypr_claw_tools::os_tools::FsWriteTool));
     registry.register(Arc::new(hypr_claw_tools::os_tools::FsListTool));
 
-    registry.register_hidden(Arc::new(
-        hypr_claw_tools::imported::Fs2ReadTool::new("./sandbox")?,
-    ));
-    registry.register_hidden(Arc::new(
-        hypr_claw_tools::imported::Fs2WriteTool::new("./sandbox")?,
-    ));
-    registry.register_hidden(Arc::new(
-        hypr_claw_tools::imported::Fs2ListTool::new("./sandbox")?,
-    ));
-    registry.register_hidden(Arc::new(
-        hypr_claw_tools::imported::Fs2EditTool::new("./sandbox")?,
-    ));
-    registry.register_hidden(Arc::new(
-        hypr_claw_tools::imported::Fs2AppendTool::new("./sandbox")?,
-    ));
+    registry.register_hidden(Arc::new(hypr_claw_tools::imported::Fs2ReadTool::new(
+        "./sandbox",
+    )?));
+    registry.register_hidden(Arc::new(hypr_claw_tools::imported::Fs2WriteTool::new(
+        "./sandbox",
+    )?));
+    registry.register_hidden(Arc::new(hypr_claw_tools::imported::Fs2ListTool::new(
+        "./sandbox",
+    )?));
+    registry.register_hidden(Arc::new(hypr_claw_tools::imported::Fs2EditTool::new(
+        "./sandbox",
+    )?));
+    registry.register_hidden(Arc::new(hypr_claw_tools::imported::Fs2AppendTool::new(
+        "./sandbox",
+    )?));
 
     registry.register(Arc::new(hypr_claw_tools::os_tools::HyprWorkspaceSwitchTool));
     hypr_claw_tools::register_workspace_tools(&mut registry);
@@ -48,10 +48,19 @@ pub fn build_tool_registry() -> anyhow::Result<hypr_claw_tools::ToolRegistryImpl
     registry.register(Arc::new(hypr_claw_tools::os_tools::ProcKillTool));
     registry.register(Arc::new(hypr_claw_tools::os_tools::ProcListTool));
     registry.register(Arc::new(hypr_claw_tools::os_tools::DesktopOpenUrlTool));
+    registry.register(Arc::new(
+        hypr_claw_tools::os_tools::DesktopOpenWorkspaceAppTool,
+    ));
     registry.register(Arc::new(hypr_claw_tools::os_tools::DesktopLaunchAppTool));
     registry.register(Arc::new(
         hypr_claw_tools::os_tools::DesktopLaunchAppAndWaitTextTool,
     ));
+    registry.register(Arc::new(hypr_claw_tools::os_tools::BrowserHealthTool));
+    registry.register(Arc::new(hypr_claw_tools::os_tools::BrowserNavigateTool));
+    registry.register(Arc::new(hypr_claw_tools::os_tools::BrowserSnapshotTool));
+    registry.register(Arc::new(hypr_claw_tools::os_tools::BrowserActionTool));
+    registry.register(Arc::new(hypr_claw_tools::os_tools::BrowserEvaluateTool));
+    registry.register(Arc::new(hypr_claw_tools::os_tools::BrowserScreenshotTool));
     registry.register(Arc::new(hypr_claw_tools::os_tools::DesktopSearchWebTool));
     registry.register(Arc::new(hypr_claw_tools::os_tools::DesktopOpenGmailTool));
     registry.register(Arc::new(hypr_claw_tools::os_tools::DesktopTypeTextTool));
