@@ -4,6 +4,7 @@ use super::{OsError, OsResult};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::OnceLock;
 use tokio::process::Command;
 use tokio::time::{sleep, Duration, Instant};
@@ -414,6 +415,40 @@ fn push_target_unique(
     }
 }
 
+async fn spawn_and_verify_launch(
+    command: &str,
+    args: &[String],
+    attempted_label: &str,
+) -> OsResult<u32> {
+    let child = Command::new(command)
+        .args(args.iter().map(String::as_str))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let pid = child.id().unwrap_or_default();
+    match tokio::time::timeout(Duration::from_millis(900), child.wait_with_output()).await {
+        Ok(Ok(output)) => {
+            if output.status.success() {
+                Ok(pid)
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                let detail = if stderr.is_empty() {
+                    format!("exit status {:?}", output.status.code())
+                } else {
+                    stderr
+                };
+                Err(OsError::OperationFailed(format!(
+                    "{} failed immediately: {}",
+                    attempted_label, detail
+                )))
+            }
+        }
+        Ok(Err(error)) => Err(OsError::Io(error)),
+        Err(_) => Ok(pid),
+    }
+}
+
 fn build_launch_targets(app: &str, args: &[String]) -> Vec<LaunchTarget> {
     let mut targets = Vec::<LaunchTarget>::new();
     let mut seen = HashSet::<String>::new();
@@ -507,13 +542,10 @@ pub async fn launch_app(app: &str, args: &[String]) -> OsResult<u32> {
                     attempted.push(format!("{display} (missing in PATH)"));
                     continue;
                 }
-                match Command::new(&program)
-                    .args(args.iter().map(String::as_str))
-                    .spawn()
-                {
-                    Ok(child) => return Ok(child.id().unwrap_or_default()),
-                    Err(e) => {
-                        attempted.push(format!("{display} ({e})"));
+                match spawn_and_verify_launch(&program, &args, &display).await {
+                    Ok(pid) => return Ok(pid),
+                    Err(error) => {
+                        attempted.push(format!("{display} ({error})"));
                     }
                 }
             }
@@ -522,14 +554,12 @@ pub async fn launch_app(app: &str, args: &[String]) -> OsResult<u32> {
                     attempted.push(format!("flatpak run {} (flatpak missing)", app_id));
                     continue;
                 }
-                match Command::new("flatpak")
-                    .arg("run")
-                    .arg(&app_id)
-                    .args(args.iter().map(String::as_str))
-                    .spawn()
-                {
-                    Ok(child) => return Ok(child.id().unwrap_or_default()),
-                    Err(e) => attempted.push(format!("flatpak run {} ({})", app_id, e)),
+                let mut launch_args = vec!["run".to_string(), app_id.clone()];
+                launch_args.extend(args.iter().cloned());
+                let display = format!("flatpak run {}", app_id);
+                match spawn_and_verify_launch("flatpak", &launch_args, &display).await {
+                    Ok(pid) => return Ok(pid),
+                    Err(error) => attempted.push(format!("{display} ({error})")),
                 }
             }
             LaunchTarget::GtkLaunch { desktop_id } => {
@@ -537,9 +567,11 @@ pub async fn launch_app(app: &str, args: &[String]) -> OsResult<u32> {
                     attempted.push(format!("gtk-launch {} (gtk-launch missing)", desktop_id));
                     continue;
                 }
-                match Command::new("gtk-launch").arg(&desktop_id).spawn() {
-                    Ok(child) => return Ok(child.id().unwrap_or_default()),
-                    Err(e) => attempted.push(format!("gtk-launch {} ({})", desktop_id, e)),
+                let launch_args = vec![desktop_id.clone()];
+                let display = format!("gtk-launch {}", desktop_id);
+                match spawn_and_verify_launch("gtk-launch", &launch_args, &display).await {
+                    Ok(pid) => return Ok(pid),
+                    Err(error) => attempted.push(format!("{display} ({error})")),
                 }
             }
         }
@@ -874,9 +906,12 @@ pub async fn read_screen_state(
 
 /// Capture current screen to file and return saved path.
 pub async fn capture_screen(path: Option<&str>) -> OsResult<String> {
-    let target = path
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("/tmp/hypr-claw-shot-{}.png", chrono::Utc::now().timestamp_millis()));
+    let target = path.map(|s| s.to_string()).unwrap_or_else(|| {
+        format!(
+            "/tmp/hypr-claw-shot-{}.png",
+            chrono::Utc::now().timestamp_millis()
+        )
+    });
 
     if let Some(parent) = Path::new(&target).parent() {
         if !parent.as_os_str().is_empty() && !parent.exists() {
@@ -1018,10 +1053,7 @@ fn build_phrase_matches(
         let abs = search_from + rel;
         let abs_end = abs + query_norm.len();
 
-        let start_idx = spans
-            .iter()
-            .position(|(_, end)| *end > abs)
-            .unwrap_or(0);
+        let start_idx = spans.iter().position(|(_, end)| *end > abs).unwrap_or(0);
         let end_idx = spans
             .iter()
             .enumerate()

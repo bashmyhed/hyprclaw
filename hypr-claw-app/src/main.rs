@@ -13,24 +13,90 @@ use config::{Config, LLMProvider};
 
 enum UiInputEvent {
     Line(String),
+    CliPrompt(String),
     RunQueued(SupervisedTask),
     Skip,
 }
 
+enum CliMode {
+    Interactive,
+    OneShot(String),
+    Status,
+    Health,
+    Help,
+    Invalid(String),
+}
+
 const MAX_RECOVERY_ATTEMPTS: u32 = 2;
+
+fn parse_cli_mode(args: &[String]) -> CliMode {
+    if args.len() <= 1 {
+        return CliMode::Interactive;
+    }
+
+    match args[1].as_str() {
+        "help" | "--help" | "-h" => CliMode::Help,
+        "status" => CliMode::Status,
+        "health" => CliMode::Health,
+        "run" | "ask" | "exec" | "prompt" | "--prompt" | "-p" => {
+            let prompt = args[2..].join(" ").trim().to_string();
+            if prompt.is_empty() {
+                CliMode::Invalid("Missing prompt text. Use `hypr-claw run <prompt>`.".to_string())
+            } else {
+                CliMode::OneShot(prompt)
+            }
+        }
+        _ => CliMode::OneShot(args[1..].join(" ").trim().to_string()),
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse CLI arguments
-    let args: Vec<String> = std::env::args().collect();
+    let raw_args: Vec<String> = std::env::args().collect();
+    let debug_mode = raw_args.iter().any(|arg| arg == "--debug" || arg == "-d");
+    let args: Vec<String> = raw_args
+        .into_iter()
+        .filter(|arg| arg != "--debug" && arg != "-d")
+        .collect();
     if args.len() > 1 && args[1] == "config" && args.get(2).map(|s| s.as_str()) == Some("reset") {
         return handle_config_reset();
+    }
+    let cli_mode = parse_cli_mode(&args);
+    match &cli_mode {
+        CliMode::Help => {
+            print_help();
+            return Ok(());
+        }
+        CliMode::Invalid(message) => {
+            eprintln!("❌ {}", message);
+            eprintln!();
+            print_help();
+            return Err("invalid command line arguments".into());
+        }
+        _ => {}
     }
 
     // Initialize directories
     if let Err(e) = initialize_directories() {
         eprintln!("❌ Failed to initialize directories: {}", e);
         return Err(e);
+    }
+
+    if !Config::exists() {
+        match &cli_mode {
+            CliMode::Health => {
+                let runtime_health = hypr_claw_tools::probe_runtime_health();
+                print_unconfigured_panel("health", &runtime_health);
+                return Ok(());
+            }
+            CliMode::Status => {
+                let runtime_health = hypr_claw_tools::probe_runtime_health();
+                print_unconfigured_panel("status", &runtime_health);
+                return Ok(());
+            }
+            _ => {}
+        }
     }
 
     // Load or bootstrap configuration
@@ -77,8 +143,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         LLMProvider::GeminiCli => "Gemini CLI",
         LLMProvider::Codex => "OpenAI Codex (ChatGPT Plus/Pro)",
     };
+    let requires_agent_runtime = matches!(cli_mode, CliMode::Interactive | CliMode::OneShot(_));
 
-    if !config.provider.supports_function_calling() {
+    if requires_agent_runtime && !config.provider.supports_function_calling() {
         eprintln!(
             "❌ Provider '{}' does not support function/tool calling in agent mode.",
             provider_name
@@ -182,6 +249,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     registry.register(Arc::new(hypr_claw_tools::os_tools::FsWriteTool));
     registry.register(Arc::new(hypr_claw_tools::os_tools::FsListTool));
     registry.register(Arc::new(hypr_claw_tools::os_tools::HyprWorkspaceSwitchTool));
+    hypr_claw_tools::register_workspace_tools(&mut registry);
     registry.register(Arc::new(
         hypr_claw_tools::os_tools::HyprWorkspaceMoveWindowTool,
     ));
@@ -206,6 +274,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     registry.register(Arc::new(
         hypr_claw_tools::os_tools::DesktopCaptureScreenTool,
     ));
+    registry.register(Arc::new(hypr_claw_tools::os_tools::DesktopHealthStatusTool));
+    registry.register(Arc::new(hypr_claw_tools::DesktopFastWindowStateTool));
     registry.register(Arc::new(hypr_claw_tools::os_tools::DesktopActiveWindowTool));
     registry.register(Arc::new(hypr_claw_tools::os_tools::DesktopListWindowsTool));
     registry.register(Arc::new(hypr_claw_tools::os_tools::DesktopMouseMoveTool));
@@ -242,7 +312,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         5000,
     ));
 
-    let allowed_tools = derive_runtime_allowed_tools(&registry_arc, &capability_registry);
+    let runtime_health = hypr_claw_tools::probe_runtime_health();
+    println!(
+        "  • backend health: {}",
+        format_runtime_health(&runtime_health)
+    );
+
+    let allowed_tools =
+        derive_runtime_allowed_tools(&registry_arc, &capability_registry, &runtime_health);
     if allowed_tools.is_empty() {
         return Err("No runtime tools available after capability filtering".into());
     }
@@ -255,11 +332,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime_dispatcher = Arc::new(RuntimeDispatcherAdapter::new(
         dispatcher,
         action_feed.clone(),
+        debug_mode,
     ));
     let runtime_registry = Arc::new(RuntimeRegistryAdapter::new(
         registry_arc.clone(),
         allowed_tools_state.clone(),
     ));
+
+    let task_manager = Arc::new(hypr_claw_tasks::TaskManager::with_state_file(
+        "./data/tasks/tasks.json",
+    ));
+    task_manager.restore().await?;
+    let initial_task_list = task_manager.list_tasks().await;
+    context.active_tasks = to_context_tasks(initial_task_list.clone());
+    context_manager.save(&context).await?;
+
+    match &cli_mode {
+        CliMode::Status => {
+            print_status_panel(
+                &session_key,
+                &agent_name,
+                &display_name(&agent_state, &user_id),
+                &config.model,
+                &agent_state.active_thread_id,
+                &agent_state,
+                &context,
+                &initial_task_list,
+                &runtime_health,
+                &active_allowed_tools,
+            );
+            return Ok(());
+        }
+        CliMode::Health => {
+            print_health_panel(
+                provider_name,
+                &config.model,
+                &runtime_health,
+                &active_allowed_tools,
+            );
+            return Ok(());
+        }
+        _ => {}
+    }
 
     // Initialize LLM client based on provider
     let llm_client = match &config.provider {
@@ -321,14 +435,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         active_soul.max_iterations,
     );
 
-    // Create task manager
-    let task_manager = Arc::new(hypr_claw_tasks::TaskManager::with_state_file(
-        "./data/tasks/tasks.json",
-    ));
-    task_manager.restore().await?;
-    context.active_tasks = to_context_tasks(task_manager.list_tasks().await);
-    context_manager.save(&context).await?;
-
     // Run REPL loop
     let system_prompt = active_soul.system_prompt.clone();
 
@@ -340,6 +446,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &user_id,
         &session_key,
         &agent_state.active_thread_id,
+        &runtime_health,
+        &active_allowed_tools,
+        cli_mode_label(&cli_mode),
     );
 
     // Setup interrupt signal (Ctrl+C interrupts current request, does not exit process)
@@ -352,6 +461,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     let mut auto_queued_task: Option<SupervisedTask> = None;
+    let mut pending_cli_prompt = match &cli_mode {
+        CliMode::OneShot(prompt) => Some(prompt.clone()),
+        _ => None,
+    };
+    let mut cli_run_error: Option<String> = None;
     let mut queue_block_notice: Option<String> = None;
     let mut transcript_view_mode = true;
     let mut background_task_index: HashMap<String, TaskStateDigest> = HashMap::new();
@@ -452,7 +566,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             context_manager.save(&context).await?;
         }
 
-        if auto_queued_task.is_none() && agent_state.supervisor.auto_run {
+        if pending_cli_prompt.is_none()
+            && auto_queued_task.is_none()
+            && agent_state.supervisor.auto_run
+        {
             loop {
                 match start_next_queued_supervised_task(&mut agent_state) {
                     QueueStartResult::Started(task) => {
@@ -491,6 +608,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &system_prompt,
                                 &agent_state.onboarding.system_profile,
                                 &capability_registry,
+                                &runtime_health,
                                 &active_allowed_tools,
                                 &agent_state.autonomy_mode,
                             );
@@ -539,7 +657,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             Ok(Ok(response)) => Ok(response),
                                             Ok(Err(e)) => Err(e.to_string()),
                                             Err(_) => Err(format!(
-                                                "Execution watchdog timeout after {}s",
+                                                "Agent stalled: execution watchdog timeout after {}s",
                                                 timeout_bg.as_secs()
                                             )),
                                         }
@@ -650,6 +768,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
             result = async {
+                if let Some(prompt) = pending_cli_prompt.take() {
+                    return UiInputEvent::CliPrompt(prompt);
+                }
                 if let Some(task) = auto_queued_task.take() {
                     return UiInputEvent::RunQueued(task);
                 }
@@ -676,12 +797,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             } => {
                 let mut queued_execution: Option<SupervisedTask> = None;
-                let (input, input_from_queue) = match result {
-                    UiInputEvent::Line(s) => (sanitize_user_input_line(&s), false),
+                let (input, input_from_queue, exit_after_current_run) = match result {
+                    UiInputEvent::CliPrompt(s) => (sanitize_user_input_line(&s), false, true),
                     UiInputEvent::RunQueued(task) => {
                         queued_execution = Some(task.clone());
-                        (task.prompt.clone(), true)
+                        (task.prompt.clone(), true, false)
                     }
+                    UiInputEvent::Line(s) => (sanitize_user_input_line(&s), false, false),
                     UiInputEvent::Skip => continue,
                 };
 
@@ -730,6 +852,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &agent_state,
                             &context,
                             &task_list,
+                            &runtime_health,
+                            &active_allowed_tools,
+                        );
+                        println!();
+                        continue;
+                    }
+                    "health" | "/health" => {
+                        print_health_panel(
+                            provider_name,
+                            &config.model,
+                            &runtime_health,
+                            &active_allowed_tools,
                         );
                         println!();
                         continue;
@@ -1408,6 +1542,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     &system_prompt,
                                     &agent_state.onboarding.system_profile,
                                     &capability_registry,
+                                    &runtime_health,
                                     &active_allowed_tools,
                                     &agent_state.autonomy_mode,
                                 );
@@ -1762,10 +1897,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     thread_session_key(&session_key, &agent_state.active_thread_id);
                 let strict_workflow = strict_workflow_enabled();
                 let focused_tools = focused_tools_for_input(&effective_input, &active_allowed_tools);
-                let use_focused = !strict_workflow
-                    && matches!(agent_state.autonomy_mode, AutonomyMode::Guarded)
-                    && !focused_tools.is_empty()
-                    && focused_tools.len() < active_allowed_tools.len();
+                let use_focused = !focused_tools.is_empty()
+                    && focused_tools.len() + 2 < active_allowed_tools.len()
+                    && (strict_workflow
+                        || matches!(agent_state.autonomy_mode, AutonomyMode::PromptFirst)
+                        || matches!(agent_state.autonomy_mode, AutonomyMode::Guarded));
                 if use_focused {
                     runtime_registry.set_allowed_tools(focused_tools.clone());
                 }
@@ -1802,12 +1938,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         None
                     },
+                    debug_mode,
                 );
 
                 let turn_system_prompt = augment_system_prompt_for_turn(
                     &system_prompt,
                     &agent_state.onboarding.system_profile,
                     &capability_registry,
+                    &runtime_health,
                     &active_allowed_tools,
                     &agent_state.autonomy_mode,
                 );
@@ -1836,6 +1974,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
 
                     let err_lower = err_msg.to_lowercase();
+                    if err_lower.contains("interrupted by user") {
+                        agent_state.reliability.last_stage = "interrupted".to_string();
+                        break;
+                    }
                     let is_rate_limit_error = err_lower.contains("rate limit")
                         || err_lower.contains("too many requests")
                         || err_lower.contains("resource_exhausted")
@@ -2033,7 +2175,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         context.active_tasks = to_context_tasks(task_manager.list_tasks().await);
                         persist_agent_os_state(&mut context, &agent_state);
                         context_manager.save(&context).await?;
-                        if transcript_view_mode {
+                        if transcript_view_mode && debug_mode {
                             let tool_rows = action_feed_since(&action_feed, run_action_start, 20);
                             let mut result_rows =
                                 vec![format!("status: completed in {}ms", run_elapsed_ms)];
@@ -2054,12 +2196,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &result_rows,
                             );
                         }
-                        println!();
-                        println!("{}", ui_section("Assistant"));
-                        println!("{}\n", strip_ansi_and_controls(&response));
+                        print_result_panel(&response, run_elapsed_ms, debug_mode);
                     }
                     Err(e) => {
                         let error_msg = e.to_string();
+                        if exit_after_current_run {
+                            cli_run_error = Some(error_msg.clone());
+                        }
                         let stop_code = resolve_stop_code(&error_msg, fallback_attempts);
                         let hint = remediation_hint_for_stop_code(stop_code, &effective_input);
                         agent_state.reliability.last_stage = "failed".to_string();
@@ -2104,7 +2247,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         mark_plan_failed(&mut context, &error_msg);
                         persist_agent_os_state(&mut context, &agent_state);
                         context_manager.save(&context).await?;
-                        if transcript_view_mode {
+                        if transcript_view_mode && debug_mode {
                             let tool_rows = action_feed_since(&action_feed, run_action_start, 20);
                             let mut result_rows = vec![format!(
                                 "status: failed {} in {}ms",
@@ -2126,6 +2269,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         if error_msg.contains("Interrupted by user") {
                             println!("⏹ Request interrupted by user.\n");
+                        } else if stop_code == "STOP_WATCHDOG_TIMEOUT" {
+                            print_stalled_panel(
+                                watchdog_timeout.as_secs(),
+                                &hint,
+                                debug_mode,
+                                &error_msg,
+                            );
                         } else {
                             eprintln!("❌ Error [{}]: {}", stop_code, e);
                             if !hint.is_empty() {
@@ -2135,6 +2285,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+
+                if exit_after_current_run {
+                    break;
+                }
             }
         }
     }
@@ -2142,6 +2296,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     context.active_tasks = to_context_tasks(task_manager.list_tasks().await);
     persist_agent_os_state(&mut context, &agent_state);
     context_manager.save(&context).await?;
+
+    if let Some(error) = cli_run_error {
+        return Err(error.into());
+    }
 
     Ok(())
 }
@@ -2190,14 +2348,14 @@ fn initialize_directories() -> Result<(), Box<dyn std::error::Error>> {
     if !std::path::Path::new(default_agent_config).exists() {
         std::fs::write(
             default_agent_config,
-            "id: default\nsoul: default_soul.md\ntools:\n  - echo\n  - fs.read\n  - fs.write\n  - fs.list\n  - fs.create_dir\n  - fs.move\n  - fs.copy\n  - fs.delete\n  - hypr.workspace.switch\n  - hypr.workspace.move_window\n  - hypr.window.focus\n  - hypr.window.close\n  - hypr.window.move\n  - hypr.exec\n  - proc.spawn\n  - proc.kill\n  - proc.list\n  - desktop.open_url\n  - desktop.launch_app\n  - desktop.launch_app_and_wait_text\n  - desktop.search_web\n  - desktop.open_gmail\n  - desktop.type_text\n  - desktop.key_press\n  - desktop.key_combo\n  - desktop.mouse_click\n  - desktop.capture_screen\n  - desktop.active_window\n  - desktop.list_windows\n  - desktop.cursor_position\n  - desktop.read_screen_state\n  - desktop.mouse_move\n  - desktop.mouse_move_and_verify\n  - desktop.click_at\n  - desktop.click_at_and_verify\n  - desktop.ocr_screen\n  - desktop.find_text\n  - desktop.click_text\n  - desktop.wait_for_text\n  - wallpaper.set\n  - system.memory\n  - system.battery\n"
+            "id: default\nsoul: default_soul.md\ntools:\n  - echo\n  - fs.read\n  - fs.write\n  - fs.list\n  - fs.create_dir\n  - fs.move\n  - fs.copy\n  - fs.delete\n  - hypr.workspace.switch\n  - hypr_workspace_enter_agent\n  - hypr_workspace_return_user\n  - hypr.workspace.move_window\n  - hypr.window.focus\n  - hypr.window.close\n  - hypr.window.move\n  - hypr.exec\n  - proc.spawn\n  - proc.kill\n  - proc.list\n  - desktop.open_url\n  - desktop.launch_app\n  - desktop.launch_app_and_wait_text\n  - desktop.search_web\n  - desktop.open_gmail\n  - desktop.type_text\n  - desktop.key_press\n  - desktop.key_combo\n  - desktop.mouse_click\n  - desktop.capture_screen\n  - desktop.health_status\n  - desktop.fast_window_state\n  - desktop.active_window\n  - desktop.list_windows\n  - desktop.cursor_position\n  - desktop.read_screen_state\n  - desktop.mouse_move\n  - desktop.mouse_move_and_verify\n  - desktop.click_at\n  - desktop.click_at_and_verify\n  - desktop.ocr_screen\n  - desktop.find_text\n  - desktop.click_text\n  - desktop.wait_for_text\n  - wallpaper.set\n  - system.memory\n  - system.battery\n"
         )?;
     }
 
     if !std::path::Path::new(default_agent_soul).exists() {
         std::fs::write(
             default_agent_soul,
-            "You are a local Linux + Hyprland OS assistant. Follow strict workflow: observe -> plan -> execute tool -> verify -> continue until done. Choose tools dynamically from allowed set. Ask permission before destructive/high-impact actions. Use mouse+keyboard style actions for GUI tasks.",
+            "You are a local Linux + Hyprland OS assistant. Treat the whole computer as controllable from prompts: apps, browser, files, windows, typing, clicks, and system state. Follow strict workflow: observe -> plan -> execute tool -> verify -> continue until done. If backend reliability is unclear, use desktop.health_status first. Choose tools dynamically from allowed set. Ask permission before destructive/high-impact actions. Use mouse+keyboard style actions for GUI tasks.",
         )?;
     }
 
@@ -2211,7 +2369,7 @@ struct SoulProfile {
 
 fn power_agent_profile() -> SoulProfile {
     SoulProfile {
-        system_prompt: "You are a powerful local Linux + Hyprland OS assistant.\nFollow strict workflow: observe -> plan -> execute tool -> verify -> continue until done.\nFor GUI tasks, observe with desktop.read_screen_state/active_window/list_windows/cursor_position first, then act with cursor + keyboard tools.\nChoose tools dynamically from allowed_tools_now.\nAsk for permission before destructive/high-impact actions.\nAvoid hardcoded assumptions and adapt from live system/context.".to_string(),
+        system_prompt: "You are a powerful local Linux + Hyprland OS assistant.\nYour job is to operate the whole computer from prompts: launch apps, drive browser workflows, read the desktop, type, click, manage files, and complete tasks end-to-end.\nFollow strict workflow: observe -> plan -> execute tool -> verify -> continue until done.\nFor GUI tasks, use desktop.health_status when backend reliability is unclear, then observe with desktop.fast_window_state, then desktop.active_window, then desktop.list_windows, then desktop.read_screen_state with include_ocr=false; use OCR tools only when text detection is actually required.\nChoose tools dynamically from allowed_tools_now.\nAsk for permission before destructive/high-impact actions.\nAvoid hardcoded assumptions and adapt from live system/context.".to_string(),
         max_iterations: 36,
     }
 }
@@ -2287,6 +2445,7 @@ fn removed_feature_notice(input: &str) -> Option<&'static str> {
 fn derive_runtime_allowed_tools(
     registry: &Arc<hypr_claw_tools::ToolRegistryImpl>,
     capability_registry: &Value,
+    runtime_health: &hypr_claw_tools::RuntimeHealthSnapshot,
 ) -> HashSet<String> {
     let has_array_entries = |path: &str| {
         capability_registry
@@ -2314,6 +2473,11 @@ fn derive_runtime_allowed_tools(
         .any(|b| matches!(b.as_str(), "ydotool" | "wlrctl"));
     let has_screenshot_backend = has_array_entries("/capabilities/screenshot_backends");
     let has_wallpaper_backend = has_array_entries("/capabilities/wallpaper_backends");
+    let live_hyprland_ready = runtime_health.hyprland_ready();
+    let live_screenshot_ready = runtime_health.screenshot_ready();
+    let live_ocr_ready = runtime_health.ocr_ready();
+    let live_keyboard_available = runtime_health.keyboard_available();
+    let live_pointer_available = runtime_health.pointer_available();
 
     registry
         .list()
@@ -2324,25 +2488,41 @@ fn derive_runtime_allowed_tools(
             | "hypr.window.focus"
             | "hypr.window.close"
             | "hypr.window.move"
-            | "hypr.exec" => hyprland_available,
+            | "hypr.exec"
+            | "desktop.fast_window_state" => hyprland_available && live_hyprland_ready,
             "wallpaper.set" => has_wallpaper_backend,
-            "desktop.capture_screen" => has_screenshot_backend,
-            "desktop.ocr_screen" | "desktop.find_text" => has_screenshot_backend && ocr_available,
+            "desktop.capture_screen" => has_screenshot_backend && live_screenshot_ready,
+            "desktop.ocr_screen" | "desktop.find_text" => {
+                has_screenshot_backend && ocr_available && live_screenshot_ready && live_ocr_ready
+            }
             "desktop.wait_for_text" | "desktop.launch_app_and_wait_text" => {
-                has_screenshot_backend && ocr_available
+                has_screenshot_backend && ocr_available && live_screenshot_ready && live_ocr_ready
             }
-            "desktop.cursor_position" => hyprland_available,
+            "desktop.cursor_position" => hyprland_available && live_hyprland_ready,
             "desktop.mouse_move_and_verify" | "desktop.click_at_and_verify" => {
-                has_pointer_backend && hyprland_available
+                has_pointer_backend
+                    && hyprland_available
+                    && live_hyprland_ready
+                    && live_pointer_available
             }
-            "desktop.read_screen_state" => hyprland_available || has_screenshot_backend,
+            "desktop.read_screen_state" => {
+                (hyprland_available && live_hyprland_ready)
+                    || (has_screenshot_backend && live_screenshot_ready)
+            }
             "desktop.type_text" | "desktop.key_press" | "desktop.key_combo" => {
-                has_keyboard_backend
+                has_keyboard_backend && live_keyboard_available
             }
             "desktop.mouse_click" | "desktop.mouse_move" | "desktop.click_at" => {
-                has_pointer_backend
+                has_pointer_backend && live_pointer_available
             }
-            "desktop.click_text" => has_pointer_backend && has_screenshot_backend && ocr_available,
+            "desktop.click_text" => {
+                has_pointer_backend
+                    && has_screenshot_backend
+                    && ocr_available
+                    && live_pointer_available
+                    && live_screenshot_ready
+                    && live_ocr_ready
+            }
             _ => true,
         })
         .collect()
@@ -2609,6 +2789,96 @@ fn truncate_for_table(value: &str, max: usize) -> String {
     out
 }
 
+fn cli_mode_label(mode: &CliMode) -> &'static str {
+    match mode {
+        CliMode::Interactive => "interactive",
+        CliMode::OneShot(_) => "one-shot",
+        CliMode::Status => "status",
+        CliMode::Health => "health",
+        CliMode::Help => "help",
+        CliMode::Invalid(_) => "invalid",
+    }
+}
+
+fn backend_state_badge(status: &hypr_claw_tools::BackendStatus) -> String {
+    let label = match &status.backend {
+        Some(backend) => format!("{}:{backend}", status.state),
+        None => status.state.clone(),
+    };
+    match status.state.as_str() {
+        "ready" => ui_success(&label),
+        "degraded" => ui_warn(&label),
+        _ => ui_danger(&label),
+    }
+}
+
+fn overall_health_badge(snapshot: &hypr_claw_tools::RuntimeHealthSnapshot) -> String {
+    let states = [
+        snapshot.hyprland.state.as_str(),
+        snapshot.screenshot.state.as_str(),
+        snapshot.ocr.state.as_str(),
+        snapshot.keyboard.state.as_str(),
+        snapshot.pointer.state.as_str(),
+    ];
+    if states.iter().all(|state| *state == "ready") {
+        ui_success("ready")
+    } else if states.iter().any(|state| *state == "degraded") {
+        ui_warn("degraded")
+    } else {
+        ui_danger("limited")
+    }
+}
+
+fn tool_family_summary(allowed_tools: &HashSet<String>) -> String {
+    let groups = [
+        ("desktop", "desktop."),
+        ("hypr", "hypr."),
+        ("workspace", "hypr_workspace_"),
+        ("fs", "fs."),
+        ("proc", "proc."),
+        ("system", "system."),
+        ("wallpaper", "wallpaper."),
+    ];
+
+    let summary = groups
+        .iter()
+        .filter_map(|(label, prefix)| {
+            let count = allowed_tools
+                .iter()
+                .filter(|name| name.starts_with(prefix))
+                .count();
+            (count > 0).then(|| format!("{label}={count}"))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    if summary.is_empty() {
+        "none".to_string()
+    } else {
+        summary
+    }
+}
+
+fn observation_stack_summary(allowed_tools: &HashSet<String>) -> String {
+    let stack = [
+        "desktop.health_status",
+        "desktop.fast_window_state",
+        "desktop.active_window",
+        "desktop.list_windows",
+        "desktop.read_screen_state",
+    ];
+    let available = stack
+        .iter()
+        .filter(|name| allowed_tools.contains(**name))
+        .copied()
+        .collect::<Vec<_>>();
+    if available.is_empty() {
+        "none".to_string()
+    } else {
+        available.join(" -> ")
+    }
+}
+
 fn strip_ansi_and_controls(raw: &str) -> String {
     let bytes = raw.as_bytes();
     let mut out = String::with_capacity(raw.len());
@@ -2694,6 +2964,70 @@ fn sanitize_user_input_line(raw: &str) -> String {
     value
 }
 
+fn print_health_panel(
+    provider_name: &str,
+    model: &str,
+    runtime_health: &hypr_claw_tools::RuntimeHealthSnapshot,
+    allowed_tools: &HashSet<String>,
+) {
+    println!("\n{}", ui_title("Runtime Health"));
+    println!(
+        "  Provider/Model : {} / {}",
+        ui_info(provider_name),
+        ui_info(&short_model_name(model))
+    );
+    println!(
+        "  Overall        : {}",
+        overall_health_badge(runtime_health)
+    );
+    println!(
+        "  Allowed Tools  : {} [{}]",
+        ui_info(&allowed_tools.len().to_string()),
+        tool_family_summary(allowed_tools)
+    );
+    println!(
+        "  Observe Stack  : {}",
+        truncate_for_table(&observation_stack_summary(allowed_tools), 80)
+    );
+    println!(
+        "  Hyprland       : {}  {}",
+        backend_state_badge(&runtime_health.hyprland),
+        truncate_for_table(&runtime_health.hyprland.detail, 72)
+    );
+    println!(
+        "  Screenshot     : {}  {}",
+        backend_state_badge(&runtime_health.screenshot),
+        truncate_for_table(&runtime_health.screenshot.detail, 72)
+    );
+    println!(
+        "  OCR            : {}  {}",
+        backend_state_badge(&runtime_health.ocr),
+        truncate_for_table(&runtime_health.ocr.detail, 72)
+    );
+    println!(
+        "  Keyboard       : {}  {}",
+        backend_state_badge(&runtime_health.keyboard),
+        truncate_for_table(&runtime_health.keyboard.detail, 72)
+    );
+    println!(
+        "  Pointer        : {}  {}",
+        backend_state_badge(&runtime_health.pointer),
+        truncate_for_table(&runtime_health.pointer.detail, 72)
+    );
+}
+
+fn print_unconfigured_panel(
+    command_name: &str,
+    runtime_health: &hypr_claw_tools::RuntimeHealthSnapshot,
+) {
+    let allowed_tools = HashSet::new();
+    println!("\n{}", ui_title("Hypr-Claw Not Configured"));
+    println!("  Requested     : {}", ui_info(command_name));
+    println!("  Config        : {}", ui_warn("missing"));
+    println!("  Next Step     : run `hypr-claw` once to configure a provider and model");
+    print_health_panel("not configured", "none", runtime_health, &allowed_tools);
+}
+
 fn print_console_bootstrap(
     provider_name: &str,
     model: &str,
@@ -2702,6 +3036,9 @@ fn print_console_bootstrap(
     user_id: &str,
     session_key: &str,
     active_thread_id: &str,
+    runtime_health: &hypr_claw_tools::RuntimeHealthSnapshot,
+    allowed_tools: &HashSet<String>,
+    mode_label: &str,
 ) {
     println!("{}", ui_section("Hypr-Claw"));
     println!(
@@ -2723,11 +3060,33 @@ fn print_console_bootstrap(
         truncate_for_table(active_thread_id, 14)
     );
     println!(
+        "{} {}  {} {}  {} {}",
+        ui_dim("mode"),
+        ui_info(mode_label),
+        ui_dim("health"),
+        overall_health_badge(runtime_health),
+        ui_dim("tools"),
+        ui_info(&allowed_tools.len().to_string())
+    );
+    println!(
+        "{} {}",
+        ui_dim("observe"),
+        truncate_for_table(&observation_stack_summary(allowed_tools), 66)
+    );
+    println!(
         "{} {}",
         ui_dim("commands"),
         truncate_for_table(
-            "help  status  scan  capabilities  /models  tasks  queue add/run/status/clear  view",
-            64
+            "help  status  health  scan  capabilities  /models  tasks  queue add/run/status/clear",
+            72
+        )
+    );
+    println!(
+        "{} {}",
+        ui_dim("example"),
+        truncate_for_table(
+            "hypr-claw run \"open firefox and summarize the current tab\"",
+            72
         )
     );
     println!("{}", ui_divider());
@@ -2742,34 +3101,108 @@ fn print_run_panel(
     model: &str,
     active_tools: usize,
     focused_tools: Option<usize>,
+    debug_mode: bool,
 ) {
     println!();
     println!("{}", ui_section("Run"));
     println!(
-        "{} {}",
-        ui_dim("goal"),
+        "goal: {}",
         truncate_for_table(&sanitize_single_line(prompt), 112)
     );
-    println!(
-        "{} power  {}  iter={}  timeout={}s  model={}",
-        ui_dim("plan"),
-        class_label,
-        max_iterations,
-        timeout_secs,
-        short_model_name(model)
-    );
-    println!("{} observe -> plan -> execute -> verify", ui_dim("flow"));
-    let focused = focused_tools
-        .map(|count| format!(" (focused {})", count))
-        .unwrap_or_default();
-    println!("{} {} active{}", ui_dim("tools"), active_tools, focused);
+    if debug_mode {
+        let focused = focused_tools
+            .map(|count| format!(" (focused {})", count))
+            .unwrap_or_default();
+        println!(
+            "{} power  {}  iter={}  timeout={}s  model={}  tools={}{}",
+            ui_dim("meta"),
+            class_label,
+            max_iterations,
+            timeout_secs,
+            short_model_name(model),
+            active_tools,
+            focused
+        );
+    }
+    println!();
+    println!("{}", ui_section("Plan"));
+    for (index, step) in plan_steps_for_class(class_label).iter().enumerate() {
+        println!("{}. {}", index + 1, step);
+    }
+    println!();
+    println!("{}", ui_section("Tools"));
+    println!("{}", ui_dim("Running agent..."));
+}
+
+fn plan_steps_for_class(class_label: &str) -> [&'static str; 3] {
+    match class_label {
+        "question" => [
+            "observe the current system state",
+            "gather the minimum evidence needed",
+            "verify the answer and report it clearly",
+        ],
+        "investigation" => [
+            "observe the current desktop and system state",
+            "inspect relevant tools and artifacts",
+            "verify findings before reporting the result",
+        ],
+        _ => [
+            "observe the current desktop and tool state",
+            "execute the next required tool action",
+            "verify the outcome and report completion",
+        ],
+    }
+}
+
+fn print_result_panel(response: &str, run_elapsed_ms: u64, debug_mode: bool) {
+    println!();
+    println!("{}", ui_section("Result"));
+    if debug_mode {
+        println!("{} {}ms", ui_dim("elapsed"), run_elapsed_ms);
+    }
+    println!("{}", strip_ansi_and_controls(response));
+    println!();
+}
+
+fn print_stalled_panel(timeout_secs: u64, hint: &str, debug_mode: bool, error_msg: &str) {
+    println!();
+    println!("{}", ui_section("Agent Stalled"));
+    println!("The model could not complete the task within the time limit.");
+    println!();
+    println!("Possible causes:");
+    println!("* model reasoning failure");
+    println!("* missing tool capability");
+    println!("* unclear prompt");
+    println!();
+    println!("Suggestion:");
+    if hint.is_empty() {
+        println!("Try rephrasing the prompt or switching models.");
+    } else {
+        println!("{}", hint);
+    }
+    if debug_mode {
+        println!();
+        println!("{} {}s", ui_dim("timeout"), timeout_secs);
+        println!(
+            "{} {}",
+            ui_dim("detail"),
+            truncate_for_table(&sanitize_single_line(error_msg), 120)
+        );
+    }
+    println!();
 }
 
 fn print_help() {
     println!("\n{}", ui_title("Hypr-Claw Command Reference"));
+    println!("  {}", ui_accent("Launch Modes"));
+    println!("    hypr-claw                 Start interactive operator mode");
+    println!("    hypr-claw run <prompt>    Execute one prompt and exit");
+    println!("    hypr-claw status          Print runtime snapshot and exit");
+    println!("    hypr-claw health          Print backend/tool readiness and exit");
     println!("  {}", ui_accent("Core"));
     println!("    help                  Show this help");
     println!("    status                Runtime state snapshot");
+    println!("    health                Backend and tool readiness snapshot");
     println!("    scan                  Re-run standard/deep system learning scan");
     println!("    capabilities          Show runtime capability registry summary");
     println!("    clear                 Clear terminal");
@@ -2792,6 +3225,8 @@ fn print_help() {
     println!("    view                  Show current CLI view mode");
     println!("    view transcript       Enable transcript panes");
     println!("    view compact          Disable transcript panes");
+    println!("  {}", ui_accent("Flags"));
+    println!("    --debug | -d          Show full tool JSON input/output");
     println!();
 }
 
@@ -2825,7 +3260,10 @@ fn text_preview_lines(text: &str, max_lines: usize, max_width: usize) -> Vec<Str
         lines.push(format!("... (truncated, {}+ lines)", max_lines));
     }
     if lines.is_empty() {
-        lines.push(truncate_for_table(&sanitize_single_line(&sanitized), max_width));
+        lines.push(truncate_for_table(
+            &sanitize_single_line(&sanitized),
+            max_width,
+        ));
     }
     lines
 }
@@ -3042,7 +3480,7 @@ fn remediation_hint_for_stop_code(stop_code: &str, input: &str) -> String {
     let lower = input.to_lowercase();
     match stop_code {
         "STOP_USER_INTERRUPT" => "Request was interrupted. Re-run the task or queue it with 'queue add <prompt>'.".to_string(),
-        "STOP_WATCHDOG_TIMEOUT" => "Task exceeded time budget. Break it into smaller steps or run one concrete action per prompt.".to_string(),
+        "STOP_WATCHDOG_TIMEOUT" => "Try rephrasing the prompt, narrowing the task, or switching models.".to_string(),
         "STOP_TOOL_LOOP" => "Model got stuck on repeated tool calls. Try a more specific prompt with exact app/path/target window.".to_string(),
         "STOP_TOOL_FAILURE_STREAK" => "Multiple tools failed in a row. Verify required apps/backends are installed and available in PATH.".to_string(),
         "STOP_TOOL_ENFORCEMENT" => "No valid actionable tool path was produced. Use an imperative prompt like 'open X', 'create Y', or 'run Z'.".to_string(),
@@ -3073,6 +3511,8 @@ fn print_status_panel(
     agent_state: &AgentOsState,
     context: &hypr_claw_memory::types::ContextData,
     task_list: &[hypr_claw_tasks::TaskInfo],
+    runtime_health: &hypr_claw_tools::RuntimeHealthSnapshot,
+    allowed_tools: &HashSet<String>,
 ) {
     let running = task_list
         .iter()
@@ -3106,10 +3546,7 @@ fn print_status_panel(
         ui_info(agent_name),
         ui_info(display_name)
     );
-    println!(
-        "  Mode         : {}",
-        ui_info("power")
-    );
+    println!("  Mode         : {}", ui_info("power"));
     println!(
         "  Scan Depth   : {}",
         if agent_state.onboarding.deep_scan_completed {
@@ -3141,8 +3578,20 @@ fn print_status_panel(
     );
     println!(
         "  Supervisor   : {} queued / {} running",
-        supervisor_queued,
-        supervisor_running
+        supervisor_queued, supervisor_running
+    );
+    println!(
+        "  Health       : {}",
+        truncate_for_table(&format_runtime_health(runtime_health), 84)
+    );
+    println!(
+        "  AllowedTools : {} [{}]",
+        allowed_tools.len(),
+        tool_family_summary(allowed_tools)
+    );
+    println!(
+        "  Observe      : {}",
+        truncate_for_table(&observation_stack_summary(allowed_tools), 84)
     );
     println!(
         "  Memory       : history={} facts={} approvals={} pending={}",
@@ -3298,7 +3747,7 @@ where
             "Interrupted by user".to_string()
         )),
         _ = tokio::time::sleep(timeout) => Err(hypr_claw_runtime::RuntimeError::LLMError(
-            format!("Execution watchdog timeout after {}s", timeout.as_secs())
+            format!("Agent stalled: execution watchdog timeout after {}s", timeout.as_secs())
         )),
     }
 }
@@ -4991,9 +5440,7 @@ fn reconcile_supervisor_after_restart(state: &mut AgentOsState) -> usize {
 
 fn print_supervisor_queue(state: &AgentOsState) {
     println!("\n🧰 Supervisor Queue");
-    println!(
-        "  actions: queue status | queue add <prompt> | queue run | queue clear"
-    );
+    println!("  actions: queue status | queue add <prompt> | queue run | queue clear");
     if state.supervisor.tasks.is_empty() {
         println!("  empty");
         println!();
@@ -5055,11 +5502,7 @@ fn print_supervisor_queue_status(state: &AgentOsState) {
     println!("\n📌 Supervisor Queue Status");
     println!(
         "  queued={} running={} done={} failed={} cancelled={}",
-        queued,
-        running,
-        completed,
-        failed,
-        cancelled
+        queued, running, completed, failed, cancelled
     );
 
     let mut running_rows = state
@@ -5156,6 +5599,7 @@ fn augment_system_prompt_for_turn(
     base_prompt: &str,
     profile: &Value,
     capability_registry: &Value,
+    runtime_health: &hypr_claw_tools::RuntimeHealthSnapshot,
     allowed_tools: &HashSet<String>,
     autonomy_mode: &AutonomyMode,
 ) -> String {
@@ -5248,24 +5692,26 @@ fn augment_system_prompt_for_turn(
                 .and_then(|v| v.as_u64())
         })
         .unwrap_or(0);
+    let backend_health = format_runtime_health(runtime_health);
+    let intent_routing_hint = "Intent routing hints:\n- For Gmail/mail in browser, prefer desktop.open_gmail or desktop.open_url before generic app launch.\n- For YouTube/video/web targets, prefer desktop.open_url or desktop.search_web before generic app launch.\n- For Telegram/native chat apps, prefer desktop.launch_app, then verify with desktop.fast_window_state / desktop.list_windows / desktop.read_screen_state.\n- If an app launch fails, immediately switch to the next valid fallback instead of waiting.";
 
     let mut tools = allowed_tools.iter().cloned().collect::<Vec<String>>();
     tools.sort();
     let policy_block = if strict_workflow_enabled() {
-        "Strict workflow:\n1) Observe first using desktop.read_screen_state/active_window/list_windows/cursor_position before GUI actions.\n2) Plan short and execute using tools, not explanation-only text.\n3) Prefer one decisive tool call at a time with valid JSON input.\n4) After each action, verify with tools (cursor/window/screen/file/process checks) and continue until done.\n5) Ask for user permission before high-impact or destructive actions.\n6) Stop only when truly blocked and report exact blocker + next best option."
+        format!("Strict workflow:\n1) Observe first using desktop.health_status when backend reliability is unclear, then desktop.fast_window_state, then desktop.active_window, then desktop.list_windows, then desktop.read_screen_state with include_ocr=false; use OCR tools only when text detection is required.\n2) Plan short and execute using tools, not explanation-only text.\n3) Prefer one decisive tool call at a time with valid JSON input.\n4) After each action, verify with tools (cursor/window/screen/file/process checks) and continue until done.\n5) Ask for user permission before high-impact or destructive actions.\n6) Stop only when truly blocked and report exact blocker + next best option.\n\n{}", intent_routing_hint)
     } else {
         match autonomy_mode {
             AutonomyMode::PromptFirst => {
-                "Execution policy:\n1) Perform actions using tools, not explanation.\n2) You control fallback order dynamically; adapt tool strategy from observed failures.\n3) Prefer one decisive tool call at a time with valid JSON input.\n4) For opening local apps, prefer desktop.launch_app before proc.spawn/open_url and use launcher_commands/vscode_hint.\n5) End with concise result and what changed.\n6) Stop only when truly blocked after trying multiple tool paths."
+                format!("Execution policy:\n1) Perform actions using tools, not explanation.\n2) Use desktop.health_status early if the environment/tooling seems uncertain, then adapt fallback order dynamically from observed failures.\n3) Prefer one decisive tool call at a time with valid JSON input.\n4) For opening local apps, prefer desktop.launch_app before proc.spawn/open_url and use launcher_commands/vscode_hint.\n5) End with concise result and what changed.\n6) Stop only when truly blocked after trying multiple tool paths.\n\n{}", intent_routing_hint)
             }
             AutonomyMode::Guarded => {
-                "Execution policy:\n1) Perform actions using tools, not explanation.\n2) If a tool fails, choose an alternative backend/tool and continue.\n3) For opening local apps, try desktop.launch_app first, then proc.spawn as fallback; use launcher_commands/vscode_hint.\n4) End with concise result and what changed.\n5) Only stop as blocked after trying alternatives available in runtime context."
+                format!("Execution policy:\n1) Perform actions using tools, not explanation.\n2) If a tool fails or the desktop environment is uncertain, use desktop.health_status and choose an alternative backend/tool.\n3) For opening local apps, try desktop.launch_app first, then proc.spawn as fallback; use launcher_commands/vscode_hint.\n4) End with concise result and what changed.\n5) Only stop as blocked after trying alternatives available in runtime context.\n\n{}", intent_routing_hint)
             }
         }
     };
 
     format!(
-        "{}\n\nRuntime context:\n- autonomy_mode: {}\n- workflow_mode: {}\n- capability_registry_generated_at: {}\n- distro: {}\n- kernel: {}\n- active_workspace: {}\n- wallpaper_backends: {}\n- screenshot_backends: {}\n- input_backends: {}\n- vscode_hint: {}\n- launcher_commands: {}\n- preferred_launchers: {}\n- known_projects: {}\n- known_downloads_dir: {}\n- installed_packages: {}\n- allowed_tools_now: {}\n\n{}",
+        "{}\n\nRuntime context:\n- autonomy_mode: {}\n- workflow_mode: {}\n- capability_registry_generated_at: {}\n- distro: {}\n- kernel: {}\n- active_workspace: {}\n- backend_health: {}\n- wallpaper_backends: {}\n- screenshot_backends: {}\n- input_backends: {}\n- vscode_hint: {}\n- launcher_commands: {}\n- preferred_launchers: {}\n- known_projects: {}\n- known_downloads_dir: {}\n- installed_packages: {}\n- allowed_tools_now: {}\n\n{}",
         base_prompt,
         autonomy_mode.as_str(),
         if strict_workflow_enabled() { "strict" } else { "legacy" },
@@ -5273,6 +5719,7 @@ fn augment_system_prompt_for_turn(
         distro,
         kernel,
         workspace,
+        backend_health,
         list_from_registry("/capabilities/wallpaper_backends", "/capabilities/wallpaper_backends"),
         list_from_registry("/capabilities/screenshot_backends", "/capabilities/screenshot_backends"),
         list_from_registry("/capabilities/input_backends", "/capabilities/input_backends"),
@@ -5296,6 +5743,37 @@ fn focused_tools_for_input(input: &str, allowed: &HashSet<String>) -> HashSet<St
             set.insert(name.to_string());
         }
     };
+    let add_observation_tools = |set: &mut HashSet<String>, allowed: &HashSet<String>| {
+        add(set, "desktop.health_status", allowed);
+        add(set, "desktop.fast_window_state", allowed);
+        add(set, "desktop.active_window", allowed);
+        add(set, "desktop.list_windows", allowed);
+        add(set, "desktop.cursor_position", allowed);
+        add(set, "desktop.read_screen_state", allowed);
+    };
+
+    let telegram_intent = lower.contains("telegram");
+    let gmail_intent = lower.contains("gmail") || lower.contains("mail") || lower.contains("inbox");
+    let youtube_intent = lower.contains("youtube")
+        || lower.contains("youtu.be")
+        || lower.contains("rickroll")
+        || lower.contains("rick roll")
+        || lower.contains("video")
+        || lower.contains(" yt ");
+    let web_intent = lower.contains("browser")
+        || lower.contains("search")
+        || lower.contains("web")
+        || lower.contains("url")
+        || lower.contains("link")
+        || gmail_intent
+        || youtube_intent;
+    let reading_intent = lower.contains("summaris")
+        || lower.contains("recent")
+        || lower.contains("message")
+        || lower.contains("messages")
+        || lower.contains("mail")
+        || lower.contains("mails")
+        || lower.contains("read");
 
     if lower.contains("wallpaper") || lower.contains("workspace") || lower.contains("window") {
         add(&mut preferred, "wallpaper.set", allowed);
@@ -5326,19 +5804,19 @@ fn focused_tools_for_input(input: &str, allowed: &HashSet<String>) -> HashSet<St
         add(&mut preferred, "fs.move", allowed);
     }
 
-    if lower.contains("open")
-        || lower.contains("browser")
-        || lower.contains("search")
-        || lower.contains("web")
-        || lower.contains("gmail")
-        || lower.contains("mail")
-    {
+    if lower.contains("open") || web_intent || telegram_intent {
+        add_observation_tools(&mut preferred, allowed);
         add(&mut preferred, "desktop.launch_app", allowed);
-        if lower.contains("gmail") || lower.contains("mail") {
+        add(&mut preferred, "hypr.window.focus", allowed);
+        add(&mut preferred, "hypr.workspace.switch", allowed);
+        if gmail_intent {
             add(&mut preferred, "desktop.open_gmail", allowed);
             add(&mut preferred, "desktop.open_url", allowed);
             add(&mut preferred, "desktop.search_web", allowed);
-        } else if lower.contains("browser") || lower.contains("search") || lower.contains("web") {
+        } else if youtube_intent {
+            add(&mut preferred, "desktop.open_url", allowed);
+            add(&mut preferred, "desktop.search_web", allowed);
+        } else if web_intent {
             add(&mut preferred, "desktop.search_web", allowed);
             add(&mut preferred, "desktop.open_url", allowed);
         } else {
@@ -5355,16 +5833,14 @@ fn focused_tools_for_input(input: &str, allowed: &HashSet<String>) -> HashSet<St
         || lower.contains("mouse")
         || lower.contains("screenshot")
         || lower.contains("screen")
+        || reading_intent
     {
-        add(&mut preferred, "desktop.read_screen_state", allowed);
-        add(&mut preferred, "desktop.cursor_position", allowed);
+        add_observation_tools(&mut preferred, allowed);
         add(&mut preferred, "desktop.type_text", allowed);
         add(&mut preferred, "desktop.key_press", allowed);
         add(&mut preferred, "desktop.key_combo", allowed);
         add(&mut preferred, "desktop.mouse_click", allowed);
         add(&mut preferred, "desktop.capture_screen", allowed);
-        add(&mut preferred, "desktop.active_window", allowed);
-        add(&mut preferred, "desktop.list_windows", allowed);
         add(&mut preferred, "desktop.mouse_move", allowed);
         add(&mut preferred, "desktop.mouse_move_and_verify", allowed);
         add(&mut preferred, "desktop.click_at", allowed);
@@ -5372,6 +5848,7 @@ fn focused_tools_for_input(input: &str, allowed: &HashSet<String>) -> HashSet<St
         add(&mut preferred, "desktop.ocr_screen", allowed);
         add(&mut preferred, "desktop.find_text", allowed);
         add(&mut preferred, "desktop.click_text", allowed);
+        add(&mut preferred, "desktop.wait_for_text", allowed);
     }
 
     if lower.contains("run")
@@ -5398,6 +5875,24 @@ fn focused_tools_for_input(input: &str, allowed: &HashSet<String>) -> HashSet<St
 
     add(&mut preferred, "echo", allowed);
     preferred
+}
+
+fn format_runtime_health(snapshot: &hypr_claw_tools::RuntimeHealthSnapshot) -> String {
+    [
+        format!("hyprland={}", format_backend_status(&snapshot.hyprland)),
+        format!("screenshot={}", format_backend_status(&snapshot.screenshot)),
+        format!("ocr={}", format_backend_status(&snapshot.ocr)),
+        format!("keyboard={}", format_backend_status(&snapshot.keyboard)),
+        format!("pointer={}", format_backend_status(&snapshot.pointer)),
+    ]
+    .join(", ")
+}
+
+fn format_backend_status(status: &hypr_claw_tools::BackendStatus) -> String {
+    match &status.backend {
+        Some(backend) => format!("{}({})", status.state, backend),
+        None => status.state.clone(),
+    }
 }
 
 fn emergency_tool_subset(input: &str, allowed: &HashSet<String>) -> HashSet<String> {
@@ -5430,17 +5925,34 @@ fn fallback_playbook_for_input(input: &str, allowed: &HashSet<String>) -> String
         || lower.contains("gmail")
         || lower.contains("telegram")
         || lower.contains("browser")
-        || lower.contains("vscode");
+        || lower.contains("vscode")
+        || lower.contains("youtube")
+        || lower.contains("rickroll")
+        || lower.contains("rick roll");
     if desktop_intent {
-        rows.push((
-            "desktop-open",
+        let desktop_fallbacks = if lower.contains("gmail")
+            || lower.contains("mail")
+            || lower.contains("youtube")
+            || lower.contains("rickroll")
+            || lower.contains("rick roll")
+            || lower.contains("yt ")
+        {
+            vec![
+                "desktop.open_url",
+                "desktop.search_web",
+                "desktop.launch_app",
+                "proc.spawn",
+                "hypr.exec",
+            ]
+        } else {
             vec![
                 "desktop.launch_app",
                 "desktop.open_url",
                 "proc.spawn",
                 "hypr.exec",
-            ],
-        ));
+            ]
+        };
+        rows.push(("desktop-open", desktop_fallbacks));
     }
 
     let screen_intent = lower.contains("screen")
@@ -5451,7 +5963,11 @@ fn fallback_playbook_for_input(input: &str, allowed: &HashSet<String>) -> String
         rows.push((
             "screen-automation",
             vec![
-                "desktop.read_screen_state",
+                "desktop.health_status",
+                "desktop.fast_window_state",
+                "desktop.active_window",
+                "desktop.list_windows",
+                "desktop.read_screen_state(include_ocr=false)",
                 "desktop.cursor_position",
                 "desktop.capture_screen",
                 "desktop.ocr_screen",
@@ -5529,17 +6045,20 @@ struct RuntimeDispatcherAdapter {
     inner: Arc<hypr_claw_tools::ToolDispatcherImpl>,
     action_feed: Arc<Mutex<Vec<String>>>,
     action_counter: Arc<Mutex<HashMap<String, u64>>>,
+    debug_mode: bool,
 }
 
 impl RuntimeDispatcherAdapter {
     fn new(
         inner: Arc<hypr_claw_tools::ToolDispatcherImpl>,
         action_feed: Arc<Mutex<Vec<String>>>,
+        debug_mode: bool,
     ) -> Self {
         Self {
             inner,
             action_feed,
             action_counter: Arc::new(Mutex::new(HashMap::new())),
+            debug_mode,
         }
     }
 
@@ -5572,39 +6091,32 @@ impl RuntimeDispatcherAdapter {
         0
     }
 
-    fn print_action(
-        &self,
-        session_key: &str,
-        index: u64,
-        status: &str,
-        tool_name: &str,
-        detail: &str,
-    ) {
-        let tool = truncate_for_table(tool_name, 30);
-        let detail_clean = truncate_for_table(&sanitize_single_line(detail), 108);
-        let line = format!(
-            "{:>3}. {:<7} {:<30} {}",
-            index,
-            status,
-            tool,
-            detail_clean
-        );
-        self.push_action(session_key, line.clone());
-        let status_badge = match status {
-            "ok" => ui_success("OK"),
-            "tool" => ui_info("TOOL"),
-            "alias" => ui_warn("MAP"),
-            "fail" => ui_danger("FAIL"),
-            "error" => ui_danger("ERR"),
-            _ => ui_dim(status),
-        };
-        println!(
-            "{} {} {} {}",
-            ui_dim(&format!("{:>3}.", index)),
-            status_badge,
-            truncate_for_table(tool_name, 30),
-            detail_clean
-        );
+    fn print_iteration(&self, index: u64) {
+        println!("{}", ui_dim(&format!("iteration {}", index)));
+    }
+
+    fn print_action(&self, session_key: &str, line: &str) {
+        self.push_action(session_key, line.to_string());
+        println!("{}", line);
+    }
+
+    fn tool_success_line(&self, tool_name: &str, elapsed_ms: u128) -> String {
+        format!("TOOL {} ({}ms) ✔", tool_name, elapsed_ms)
+    }
+
+    fn tool_failure_line(&self, tool_name: &str, elapsed_ms: u128, detail: &str) -> String {
+        let detail = truncate_for_table(&sanitize_single_line(detail), 96);
+        format!("TOOL {} ({}ms) ✖ {}", tool_name, elapsed_ms, detail)
+    }
+
+    fn print_debug_payload(&self, label: &str, value: &serde_json::Value) {
+        if !self.debug_mode {
+            return;
+        }
+        let raw = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
+        for line in raw.lines() {
+            println!("{} {}", ui_dim(label), line);
+        }
     }
 }
 
@@ -5619,25 +6131,17 @@ impl hypr_claw_runtime::ToolDispatcher for RuntimeDispatcherAdapter {
         let normalized_tool_name = normalize_runtime_tool_name(tool_name);
         let started = std::time::Instant::now();
         let action_index = self.next_action_index(session_key);
-        self.print_action(
-            session_key,
-            action_index,
-            "tool",
-            &normalized_tool_name,
-            &format!("input={}", truncate_for_table(&input.to_string(), 112)),
-        );
-        if normalized_tool_name != tool_name {
-            self.print_action(
-                session_key,
-                action_index,
-                "alias",
-                &normalized_tool_name,
-                &format!(
-                    "remapped '{}' -> '{}'",
-                    truncate_for_table(tool_name, 24),
-                    truncate_for_table(&normalized_tool_name, 24)
-                ),
-            );
+        self.print_iteration(action_index);
+        if self.debug_mode {
+            if normalized_tool_name != tool_name {
+                println!(
+                    "{} remapped '{}' -> '{}'",
+                    ui_dim("debug"),
+                    truncate_for_table(tool_name, 32),
+                    truncate_for_table(&normalized_tool_name, 32)
+                );
+            }
+            self.print_debug_payload("input", input);
         }
         let result = self
             .inner
@@ -5650,20 +6154,12 @@ impl hypr_claw_runtime::ToolDispatcher for RuntimeDispatcherAdapter {
 
         match result {
             Ok(tool_result) => {
+                let elapsed = started.elapsed().as_millis();
                 if tool_result.success {
                     let output = tool_result.output.unwrap_or(serde_json::json!({}));
-                    let elapsed = started.elapsed().as_millis();
-                    self.print_action(
-                        session_key,
-                        action_index,
-                        "ok",
-                        &normalized_tool_name,
-                        &format!(
-                            "done in {}ms output={}",
-                            elapsed,
-                            truncate_for_table(&output.to_string(), 112)
-                        ),
-                    );
+                    let line = self.tool_success_line(&normalized_tool_name, elapsed);
+                    self.print_action(session_key, &line);
+                    self.print_debug_payload("output", &output);
                     Ok(output)
                 } else {
                     let base_detail = tool_result
@@ -5680,17 +6176,8 @@ impl hypr_claw_runtime::ToolDispatcher for RuntimeDispatcherAdapter {
                             alternatives.join(", ")
                         )
                     };
-                    self.print_action(
-                        session_key,
-                        action_index,
-                        "fail",
-                        &normalized_tool_name,
-                        &format!(
-                            "failed in {}ms {}",
-                            started.elapsed().as_millis(),
-                            truncate_for_table(&detail, 112)
-                        ),
-                    );
+                    let line = self.tool_failure_line(&normalized_tool_name, elapsed, &detail);
+                    self.print_action(session_key, &line);
                     Err(hypr_claw_runtime::RuntimeError::ToolError(detail))
                 }
             }
@@ -5706,17 +6193,12 @@ impl hypr_claw_runtime::ToolDispatcher for RuntimeDispatcherAdapter {
                         alternatives.join(", ")
                     )
                 };
-                self.print_action(
-                    session_key,
-                    action_index,
-                    "error",
+                let line = self.tool_failure_line(
                     &normalized_tool_name,
-                    &format!(
-                        "dispatcher in {}ms {}",
-                        started.elapsed().as_millis(),
-                        truncate_for_table(&detail, 112)
-                    ),
+                    started.elapsed().as_millis(),
+                    &detail,
                 );
+                self.print_action(session_key, &line);
                 Err(hypr_claw_runtime::RuntimeError::ToolError(detail))
             }
         }
@@ -5731,10 +6213,16 @@ fn fallback_tools_for_tool(tool_name: &str) -> Vec<&'static str> {
         "desktop.launch_app" => vec!["proc.spawn", "hypr.exec"],
         "proc.spawn" => vec!["hypr.exec", "desktop.launch_app"],
         "desktop.capture_screen" => vec!["hypr.exec"],
+        "desktop.fast_window_state" => vec![
+            "desktop.active_window",
+            "desktop.list_windows",
+            "desktop.read_screen_state",
+        ],
         "desktop.ocr_screen" => vec!["desktop.capture_screen"],
         "desktop.click_text" => vec!["desktop.find_text", "desktop.mouse_click"],
         "desktop.find_text" => vec!["desktop.ocr_screen", "desktop.capture_screen"],
         "desktop.read_screen_state" => vec![
+            "desktop.fast_window_state",
             "desktop.active_window",
             "desktop.list_windows",
             "desktop.cursor_position",

@@ -43,6 +43,8 @@ pub async fn run(agent: &str, user: &str, message: &str) -> Result<()> {
     // Setup tools
     let mut registry = hypr_claw_tools::ToolRegistryImpl::new();
     registry.register(Arc::new(hypr_claw_tools::tools::EchoTool));
+    hypr_claw_tools::register_workspace_tools(&mut registry);
+    registry.register(Arc::new(hypr_claw_tools::DesktopFastWindowStateTool));
     
     // Create sandbox directory
     std::fs::create_dir_all("./sandbox")?;

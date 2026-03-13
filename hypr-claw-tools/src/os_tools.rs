@@ -3,6 +3,7 @@
 use crate::error::ToolError;
 use crate::execution_context::ExecutionContext;
 use crate::os_capabilities::{desktop, filesystem, hyprland, process, system};
+use crate::runtime_health;
 use crate::tools::base::{Tool, ToolResult};
 use crate::traits::PermissionTier;
 use async_trait::async_trait;
@@ -282,6 +283,7 @@ pub struct DesktopKeyPressTool;
 pub struct DesktopKeyComboTool;
 pub struct DesktopMouseClickTool;
 pub struct DesktopCaptureScreenTool;
+pub struct DesktopHealthStatusTool;
 pub struct DesktopActiveWindowTool;
 pub struct DesktopListWindowsTool;
 pub struct DesktopMouseMoveTool;
@@ -821,6 +823,41 @@ impl Tool for DesktopActiveWindowTool {
 }
 
 #[async_trait]
+impl Tool for DesktopHealthStatusTool {
+    fn name(&self) -> &'static str {
+        "desktop.health_status"
+    }
+    fn description(&self) -> &'static str {
+        "Probe live desktop automation backend readiness for Hyprland, screenshot, OCR, keyboard, and pointer control"
+    }
+    fn permission_tier(&self) -> PermissionTier {
+        PermissionTier::Read
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        })
+    }
+    async fn execute(
+        &self,
+        _ctx: ExecutionContext,
+        _input: Value,
+    ) -> Result<ToolResult, ToolError> {
+        let snapshot = runtime_health::probe_runtime_health();
+        let output = serde_json::to_value(snapshot).map_err(|error| {
+            ToolError::ExecutionFailed(format!("failed to serialize runtime health: {error}"))
+        })?;
+        Ok(ToolResult {
+            success: true,
+            output: Some(output),
+            error: None,
+        })
+    }
+}
+
+#[async_trait]
 impl Tool for DesktopListWindowsTool {
     fn name(&self) -> &'static str {
         "desktop.list_windows"
@@ -1229,7 +1266,7 @@ impl Tool for DesktopReadScreenStateTool {
         })
     }
     async fn execute(&self, _ctx: ExecutionContext, input: Value) -> Result<ToolResult, ToolError> {
-        let include_ocr = input["include_ocr"].as_bool().unwrap_or(true);
+        let include_ocr = input["include_ocr"].as_bool().unwrap_or(false);
         let include_windows = input["include_windows"].as_bool().unwrap_or(true);
         let include_cursor = input["include_cursor"].as_bool().unwrap_or(true);
         let include_screenshot = input["include_screenshot"].as_bool().unwrap_or(true);

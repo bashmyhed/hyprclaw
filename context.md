@@ -1,6 +1,6 @@
 # Hypr-Claw Context
 
-Last updated: 2026-02-24
+Last updated: 2026-03-13
 
 ## Purpose
 
@@ -51,6 +51,9 @@ Success standard: user prompt -> completed outcome, not just "opened app" or "ca
   - `desktop.mouse_move_and_verify`
   - `desktop.click_at_and_verify`
   - `desktop.read_screen_state`
+- Live runtime backend health probing now exists:
+  - `desktop.health_status`
+  - startup tool filtering now combines persisted scan data with current backend readiness
 - Runtime tool gating now differentiates keyboard vs pointer backends.
 
 4. UX
@@ -77,9 +80,9 @@ Success standard: user prompt -> completed outcome, not just "opened app" or "ca
 ### Phase 1: Reliability Foundation (highest priority)
 
 1. Backend truth checks
-- Add runtime health probes for input/screenshot/OCR backends.
-- Only expose tools if the backend can actually execute.
-- Surface one-line health in status: screen, keyboard, pointer, OCR.
+- Runtime health probes now exist for Hyprland, screenshot, OCR, keyboard, and pointer backends.
+- Tool exposure is now filtered by both stored capabilities and live backend readiness.
+- Next step: strengthen “degraded” detection for backends like `ydotool` where daemon/uinput access can still fail at action time.
 
 2. Deterministic GUI action loop
 - Standardize action cycle:

@@ -47,11 +47,13 @@ The end product is a reliable Linux OS copilot that can execute real desktop wor
 - Queue and background task execution.
 - Model switching support.
 - Desktop automation tools including OCR, cursor movement, typing, key combos, window and app actions.
+- Live backend health probing for Hyprland, screenshot, OCR, keyboard, and pointer control.
+- Runtime tool exposure filtered by both stored capability scan and current backend readiness.
 
 ## Work Needed
 
 1. Improve reliability of long multi-step desktop workflows.
-2. Strengthen tool fallback logic for mixed environments.
+2. Strengthen tool fallback logic for mixed environments and backend degradation.
 3. Expand permission model clarity for high-impact actions.
 4. Harden tests around GUI automation and recovery.
 5. Reduce remaining legacy dead code paths and keep interfaces minimal.
